@@ -2,7 +2,6 @@ import os
 import re
 import shutil
 import argparse
-import json
 import subprocess
 import sys
 import requests
@@ -10,7 +9,6 @@ import ebooklib
 import hashlib
 from ebooklib import epub
 from bs4 import BeautifulSoup
-from pathlib import Path
 from pydub import AudioSegment
 from tqdm import tqdm
 import traceback
@@ -20,8 +18,11 @@ tmp_dir = "tmp"
 punctuation_list = ['.', ',', '!', '?', ':', ';', '"', "'", '(', ')', '[', ']', '{', '}', '/', '\\', '-', '–', '—', '…']
 switch_punctuations = {"'": "'", "'": "'", """: '"', """: '"', "„": '"', "‚": "'", "‟": '"', "′": "'", "″": '"'}
 default_audio_proc_format = "wav"
-max_tokens = 250  # Default max tokens per sentence
+max_tokens = 5  # Default max tokens per sentence
 
+DEFAULT_API_ENDPOINT = "http://localhost:10240/v1"
+DEFAULT_API_KEY = "xxxx"
+DEFAULT_MODEL = "mlx-community/Kokoro-82M-bf16"
 
 class DependencyError(Exception):
     def __init__(self, message=None):
@@ -34,8 +35,12 @@ class DependencyError(Exception):
 def prepare_dirs(input_file, output_dir=None):
     """Prepare directory structure for processing"""
     try:
+        input_file = os.path.abspath(input_file)
+
         if output_dir is None:
             output_dir = os.path.join(tmp_dir, hashlib.md5(input_file.encode()).hexdigest())
+        else:
+            output_dir = os.path.abspath(output_dir)
 
         os.makedirs(tmp_dir, exist_ok=True)
         os.makedirs(output_dir, exist_ok=True)
@@ -46,10 +51,18 @@ def prepare_dirs(input_file, output_dir=None):
         os.makedirs(chapters_dir, exist_ok=True)
         os.makedirs(chapters_dir_sentences, exist_ok=True)
 
-        ebook_path = os.path.join(output_dir, os.path.basename(input_file))
-        epub_path = os.path.join(output_dir, os.path.splitext(os.path.basename(input_file))[0] + '.epub')
+        # If the input file is already in the output directory, don't create another copy
+        if os.path.dirname(input_file) == output_dir:
+            ebook_path = input_file
+        else:
+            ebook_path = os.path.join(output_dir, os.path.basename(input_file))
+            # Only copy if not already in the right place
+            if not os.path.exists(ebook_path) or not os.path.samefile(input_file, ebook_path):
+                shutil.copy(input_file, ebook_path)
 
-        shutil.copy(input_file, ebook_path)
+        # Create a separate path for the epub version if needed
+        base_name = os.path.splitext(os.path.basename(input_file))[0]
+        epub_path = os.path.join(output_dir, f"{base_name}.epub")
 
         return {
             "process_dir": output_dir,
@@ -109,7 +122,12 @@ def normalize_text(text):
     text = re.sub(r'\t+', lambda m: ' ' * len(m.group()), text)
 
     # Add space between letters and numbers
-    text = re.sub(r'(?<=[\p{L}])(?=\d)|(?<=\d)(?=[\p{L}])', ' ', text)
+    try:
+        # This uses the regex module which supports Unicode properties
+        text = re.sub(r'(?<=[\p{L}])(?=\d)|(?<=\d)(?=[\p{L}])', ' ', text)
+    except:
+        # Fallback if regex module fails
+        text = re.sub(r'(?<=[a-zA-Z])(?=\d)|(?<=\d)(?=[a-zA-Z])', ' ', text)
 
     # Remove extra whitespace
     text = re.sub(r'\s+', ' ', text).strip()
@@ -159,50 +177,86 @@ def filter_chapter(doc):
         escaped_punctuation = re.escape(''.join(punctuation_list))
         punctuation_pattern_split = rf'(\S.*?[{"".join(escaped_punctuation)}])|\S+'
 
-        # Split by punctuation marks
-        sentences = re.findall(punctuation_pattern_split, text)
-        sentences = [sentence.strip() for sentence in sentences if sentence.strip()]
+        # Split by punctuation marks while keeping the punctuation at the end of each word
+        phoneme_list = re.findall(punctuation_pattern_split, text)
+        phoneme_list = [phoneme.strip() for phoneme in phoneme_list if phoneme.strip()]
 
         # Group sentences by token count
-        return get_sentences(sentences, max_tokens)
+        return get_sentences(phoneme_list, max_tokens)
     except Exception as e:
         print(f"Error processing document: {e}")
         return []
 
 
-def get_sentences(sentences, max_tokens):
-    """Group sentences to respect maximum token limits"""
-    result = []
-    current_sentence = ""
-    current_token_count = 0
+def get_sentences(phoneme_list, max_tokens):
+    """
+    Split a list of phonemes into proper sentences first, then respect token limits.
 
-    for sentence in sentences:
-        token_count = len(sentence.split())
+    Args:
+        phoneme_list: A list of text fragments typically ending with punctuation
+        max_tokens: Maximum number of tokens (words) allowed per sentence
 
-        if current_token_count + token_count > max_tokens:
-            if current_sentence:
-                result.append(current_sentence.strip())
-            current_sentence = sentence
-            current_token_count = token_count
+    Returns:
+        A list of sentences
+    """
+    # First, join all phonemes to get the complete text
+    complete_text = ' '.join(phoneme_list)
+
+    # Split into actual sentences using regex for period, question mark, exclamation mark
+    # followed by a space and uppercase letter or end of string
+    sentence_pattern = r'(?<=[.!?])\s+(?=[A-Z]|$)'
+    raw_sentences = re.split(sentence_pattern, complete_text)
+
+    # Further refine sentences to respect max token limit
+    final_sentences = []
+    for sentence in raw_sentences:
+        sentence = sentence.strip()
+        if not sentence:
+            continue
+
+        # Split long sentences based on token count
+        words = sentence.split()
+        if len(words) <= max_tokens:
+            final_sentences.append(sentence)
         else:
-            current_sentence += (" " if current_sentence else "") + sentence
-            current_token_count += token_count
+            # Process sentences that exceed max token count
+            current_chunk = []
+            current_token_count = 0
 
-    if current_sentence:
-        result.append(current_sentence.strip())
+            for word in words:
+                if current_token_count + 1 > max_tokens:
+                    # Add current chunk as a sentence
+                    final_sentences.append(' '.join(current_chunk))
+                    # Start a new chunk
+                    current_chunk = [word]
+                    current_token_count = 1
+                else:
+                    current_chunk.append(word)
+                    current_token_count += 1
 
-    return result
+            # Add the last chunk if it exists
+            if current_chunk:
+                final_sentences.append(' '.join(current_chunk))
 
+    return final_sentences
 
-def get_audio_from_api(text, api_endpoint, api_key):
+def get_audio_from_api(text, api_endpoint, api_key, model):
     """Get audio from OpenAI-compatible API"""
+    # Construct the proper endpoint URL for audio generation
+    if api_endpoint.endswith('/v1'):
+        api_endpoint = f"{api_endpoint}/audio/speech"
+    elif not api_endpoint.endswith('/audio/speech'):
+        api_endpoint = f"{api_endpoint.rstrip('/')}/v1/audio/speech"
+
+    print(f"Using API endpoint: {api_endpoint}")
+
     headers = {
         'Authorization': f'Bearer {api_key}',
         'Content-Type': 'application/json'
     }
 
     data = {
-        'model': 'mlx-community/Kokoro-82M-bf16',  # This can be parameterized
+        'model': model,
         'input': text
     }
 
@@ -213,38 +267,38 @@ def get_audio_from_api(text, api_endpoint, api_key):
             print(f"API error: {response.status_code} - {response.text}")
             return None
 
-        # Save the audio content
+        # Return the audio content
         return response.content
     except Exception as e:
         print(f"API request error: {e}")
         return None
 
 
-def process_chapters(chapters, dirs, api_endpoint, api_key):
-    """Process chapters and generate audio files"""
+def process_chapters(chapters, dirs, api_endpoint, api_key, model):
+    """Process chapters and generate audio files for each sentence"""
     sentence_number = 0
     total_sentences = sum(len(chapter) for chapter in chapters)
+    audio_files = []
 
     print(f"Processing {len(chapters)} chapters with {total_sentences} total sentences...")
 
     with tqdm(total=total_sentences, desc="Converting", unit="sentence") as progress_bar:
         for chapter_num, sentences in enumerate(chapters, 1):
-            chapter_sentences = []
-
             for sentence in sentences:
                 if not sentence.strip():
                     continue
 
                 # Filename for this sentence
                 sentence_file = os.path.join(dirs["chapters_dir_sentences"],
-                                             f"{sentence_number}.{default_audio_proc_format}")
+                                            f"{sentence_number}.{default_audio_proc_format}")
+                audio_files.append(sentence_file)
 
                 # Only process if file doesn't already exist
                 if not os.path.exists(sentence_file):
                     print(f"\nProcessing: {sentence}")
 
                     # Get audio from API
-                    audio_data = get_audio_from_api(sentence, api_endpoint, api_key)
+                    audio_data = get_audio_from_api(sentence, api_endpoint, api_key, model)
 
                     if audio_data:
                         # Save the audio file
@@ -254,25 +308,12 @@ def process_chapters(chapters, dirs, api_endpoint, api_key):
                     else:
                         print(f"Failed to get audio for sentence {sentence_number}")
 
-                chapter_sentences.append(sentence_file)
                 sentence_number += 1
                 progress_bar.update(1)
 
-            # Combine sentence audio files for this chapter
-            chapter_audio_file = os.path.join(dirs["chapters_dir"],
-                                              f"chapter_{chapter_num}.{default_audio_proc_format}")
-            combine_audio_sentences(chapter_sentences, chapter_audio_file)
-
-    # Combine all chapter files into final audiobook
-    chapter_files = [os.path.join(dirs["chapters_dir"], f) for f in os.listdir(dirs["chapters_dir"])
-                     if f.startswith("chapter_") and f.endswith(f".{default_audio_proc_format}")]
-
-    if chapter_files:
-        output_file = os.path.join(dirs["process_dir"], f"audiobook.{default_audio_proc_format}")
-        combine_audio_chapters(chapter_files, output_file)
-        return output_file
-
-    return None
+    # We now have individual audio files for each sentence
+    print(f"Generated {len(audio_files)} individual audio files for sentences")
+    return audio_files
 
 
 def combine_audio_sentences(sentence_files, output_file):
@@ -321,9 +362,12 @@ def main():
     parser = argparse.ArgumentParser(description="Convert eBooks to audiobooks using OpenAI-compatible API")
     parser.add_argument("--input", "-i", required=True, help="Input eBook file")
     parser.add_argument("--output-dir", "-o", help="Output directory")
-    parser.add_argument("--api-endpoint", required=True, help="OpenAI-compatible API endpoint")
-    parser.add_argument("--api-key", required=True, help="API key for authentication")
-    parser.add_argument("--max-tokens", type=int, default=250, help="Maximum tokens per sentence")
+    parser.add_argument("--api-endpoint", default=DEFAULT_API_ENDPOINT,
+                        help=f"OpenAI-compatible API endpoint (default: {DEFAULT_API_ENDPOINT})")
+    parser.add_argument("--api-key", default=DEFAULT_API_KEY,
+                        help=f"API key for authentication (default: {DEFAULT_API_KEY})")
+    parser.add_argument("--model", default=DEFAULT_MODEL, help=f"Model to use for TTS (default: {DEFAULT_MODEL})")
+    parser.add_argument("--max-tokens", type=int, default=250, help="Maximum tokens per sentence (default: 250)")
 
     args = parser.parse_args()
 
@@ -339,7 +383,16 @@ def main():
             print("Converting input file to EPUB format...")
             convert_to_epub(dirs["ebook"], dirs["epub_path"])
         else:
-            shutil.copy(dirs["ebook"], dirs["epub_path"])
+            # If input is already EPUB, don't copy to the same location
+            # Only copy if source and destination are different
+            input_path = os.path.abspath(args.input)
+            epub_path = os.path.abspath(dirs["epub_path"])
+
+            if input_path != epub_path:
+                shutil.copy(input_path, epub_path)
+
+            # Always use the file in the processing directory
+            dirs["epub_path"] = epub_path
 
         # Read the EPUB
         print("Reading EPUB content...")
@@ -352,7 +405,7 @@ def main():
             raise DependencyError("Failed to extract any chapters from the eBook")
 
         # Process chapters and generate audio
-        output_file = process_chapters(chapters, dirs, args.api_endpoint, args.api_key)
+        output_file = process_chapters(chapters, dirs, args.api_endpoint, args.api_key, args.model)
 
         if output_file and os.path.exists(output_file):
             print(f"\nAudiobook created successfully: {output_file}")
