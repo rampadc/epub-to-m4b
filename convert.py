@@ -13,6 +13,7 @@ from pydub import AudioSegment
 from tqdm import tqdm
 import traceback
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import json
 
 # Essential constants
 tmp_dir = "tmp"
@@ -236,7 +237,8 @@ def normalize_text(text):
     return text
 
 
-def get_chapters(epub_book, dirs):
+def get_chapters(epub_book, dirs, preprocess_llm=False, api_endpoint=None, api_key=None,
+                preprocess_model=None, max_chunk_size=4000, max_sentences=2, max_seconds=30.0):
     """Extract chapters from EPUB and split into sentences"""
     try:
         all_docs = list(epub_book.get_items_of_type(ebooklib.ITEM_DOCUMENT))
@@ -250,7 +252,15 @@ def get_chapters(epub_book, dirs):
         chapters = []
 
         for doc in all_docs:
-            content = filter_chapter(doc)
+            if preprocess_llm:
+                print(f"Processing document with LLM: {doc.get_name()}")
+                content = filter_chapter_with_llm(
+                    doc, api_endpoint, api_key, preprocess_model,
+                    max_chunk_size, max_sentences, max_seconds
+                )
+            else:
+                content = filter_chapter(doc)
+
             if content:  # Only add non-empty chapters
                 chapters.append(content)
 
@@ -258,6 +268,67 @@ def get_chapters(epub_book, dirs):
     except Exception as e:
         raise DependencyError(f"Error extracting chapters: {e}")
 
+def filter_chapter_with_llm(doc, api_endpoint, api_key, model, max_chunk_size=4000,
+                           max_sentences=2, max_seconds=30.0):
+    """Extract, normalize, and preprocess text from a document using LLM"""
+    try:
+        soup = BeautifulSoup(doc.get_body_content(), 'html.parser')
+
+        # Remove scripts and styles
+        for script in soup(["script", "style"]):
+            script.decompose()
+
+        # Extract text
+        text = soup.get_text().strip()
+
+        # Basic normalization
+        text = normalize_text(text)
+
+        # Use LLM to preprocess and split into sentences
+        sentences = preprocess_chapter_with_llm(text, api_endpoint, api_key, model, max_chunk_size)
+
+        # Further split into appropriately sized chunks
+        final_chunks = []
+        current_chunk = ""
+        sentence_count = 0
+
+        for sentence in sentences:
+            # Special pause indicator
+            if sentence == "[PAUSE]":
+                if current_chunk:
+                    final_chunks.append(current_chunk)
+                    current_chunk = ""
+                    sentence_count = 0
+                final_chunks.append("[PAUSE]")
+                continue
+
+            # Estimate audio duration
+            estimated_duration = len(sentence) / 5 / 3  # chars/avg word length/words per second
+
+            if (sentence_count >= max_sentences) or \
+               (estimated_duration > max_seconds * 0.7) or \
+               (current_chunk and (len(current_chunk) + len(sentence))/5/3 > max_seconds):
+
+                if current_chunk:
+                    final_chunks.append(current_chunk)
+                current_chunk = sentence
+                sentence_count = 1
+            else:
+                if current_chunk:
+                    current_chunk += " " + sentence
+                else:
+                    current_chunk = sentence
+                sentence_count += 1
+
+        # Add any remaining text
+        if current_chunk:
+            final_chunks.append(current_chunk)
+
+        return final_chunks
+    except Exception as e:
+        print(f"Error processing document with LLM: {e}")
+        traceback.print_exc()
+        return []
 
 def filter_chapter(doc):
     """Extract and normalize text from a document"""
@@ -373,11 +444,18 @@ def get_audio_from_api(text, api_endpoint, api_key, model):
         return None
 
 def process_sentence(sentence_data):
-    """Process a single sentence and return the result"""
+    """Process a single sentence chunk and return the result"""
     sentence_num, sentence, sentence_file, api_endpoint, api_key, model = sentence_data
 
     if os.path.exists(sentence_file):
         # File already exists, skip processing
+        return sentence_num, sentence_file, True
+
+    # Handle special pause indicator
+    if sentence == "[PAUSE]":
+        # Create a short pause (0.5 second of silence)
+        silence = AudioSegment.silent(duration=500)  # 500ms
+        silence.export(sentence_file, format=default_audio_proc_format)
         return sentence_num, sentence_file, True
 
     # Get audio from API
@@ -471,8 +549,112 @@ def combine_audio_sentences(sentence_files, output_file):
         traceback.print_exc()
         return False
 
+# Collect timing information
+def get_audio_duration(audio_file):
+    """Get the duration of an audio file in milliseconds"""
+    try:
+        audio = AudioSegment.from_file(audio_file)
+        return len(audio)
+    except Exception as e:
+        print(f"Error getting audio duration: {e}")
+        return 0
 
-def assemble_audiobook_m4b(chapters_dir, output_file, metadata, cover_file):
+# Build the text-audio mapping
+def build_text_audio_mapping(chapters, sentence_data, dirs):
+    """
+    Build a mapping of text fragments to audio timestamps.
+
+    Args:
+        chapters: List of chapter sentences
+        sentence_data: List of dictionaries with sentence information
+        dirs: Directory structure dictionary
+
+    Returns:
+        Path to the generated mapping file
+    """
+    try:
+        mapping = {
+            "version": "1.0",
+            "book_title": "Unknown",  # This could be populated from metadata
+            "fragments": [],
+            "chapters": []
+        }
+
+        current_time_ms = 0
+        chapter_start_times = {}
+
+        # First pass: calculate all durations and timestamps
+        print("Calculating audio timings for synchronization...")
+        for sentence_info in tqdm(sentence_data, desc="Processing timings"):
+            chapter_num = sentence_info['chapter']
+            sentence_file = sentence_info['file']
+
+            if not os.path.exists(sentence_file):
+                continue
+
+            # Record chapter start time if this is the first sentence in the chapter
+            if chapter_num not in chapter_start_times:
+                chapter_start_times[chapter_num] = current_time_ms
+
+            # Get audio duration
+            try:
+                audio = AudioSegment.from_file(sentence_file, format=default_audio_proc_format)
+                duration_ms = len(audio)
+
+                # Add to fragments list
+                fragment = {
+                    "chapter": chapter_num,
+                    "text": sentence_info['text'],
+                    "start_time": current_time_ms,
+                    "end_time": current_time_ms + duration_ms,
+                }
+
+                mapping["fragments"].append(fragment)
+
+                # Update current time
+                current_time_ms += duration_ms
+
+            except Exception as e:
+                print(f"Error processing timing for sentence {sentence_info['sentence_num']}: {e}")
+
+        # Second pass: build chapter information
+        for chapter_num in sorted(chapter_start_times.keys()):
+            start_time = chapter_start_times[chapter_num]
+
+            # Find the end time of this chapter (start of next chapter or end of book)
+            if chapter_num + 1 in chapter_start_times:
+                end_time = chapter_start_times[chapter_num + 1]
+            else:
+                end_time = current_time_ms
+
+            # Count fragments in this chapter
+            fragments_in_chapter = sum(1 for f in mapping["fragments"] if f["chapter"] == chapter_num)
+
+            mapping["chapters"].append({
+                "number": chapter_num,
+                "title": f"Chapter {chapter_num}",
+                "start_time": start_time,
+                "end_time": end_time,
+                "fragment_count": fragments_in_chapter
+            })
+
+        # Calculate total duration
+        mapping["total_duration_ms"] = current_time_ms
+
+        # Save the mapping to a JSON file
+        mapping_file = os.path.join(dirs["process_dir"], "text_audio_mapping.json")
+        with open(mapping_file, 'w', encoding='utf-8') as f:
+            json.dump(mapping, f, indent=2, ensure_ascii=False)
+
+        print(f"Created text-audio mapping file with {len(mapping['fragments'])} fragments across {len(mapping['chapters'])} chapters")
+        return mapping_file
+
+    except Exception as e:
+        print(f"Error building text-audio mapping: {e}")
+        traceback.print_exc()
+        return None
+
+def assemble_audiobook_m4b(chapters_dir, output_file, metadata, cover_file, mapping_file=None):
     """
     Assemble final audiobook in M4B format with chapter markers using PyDub for audio
     processing and FFmpeg for the final M4B creation.
@@ -482,6 +664,7 @@ def assemble_audiobook_m4b(chapters_dir, output_file, metadata, cover_file):
         output_file: Path to the final output file (should end with .m4b)
         metadata: Book metadata dictionary
         cover_file: Path to cover image file (or None)
+        mapping_file: Path to text-audio synchronization mapping file (or None)
 
     Returns:
         Path to the final audiobook file if successful, None otherwise
@@ -503,7 +686,7 @@ def assemble_audiobook_m4b(chapters_dir, output_file, metadata, cover_file):
             print("No chapter files found!")
             return None
 
-        # Sort chapter files numerically
+        # Sort chapter files numerically using our safer function
         def get_chapter_num(filename):
             match = re.search(r'chapter_(\d+)', os.path.basename(filename))
             if match:
@@ -583,6 +766,11 @@ def assemble_audiobook_m4b(chapters_dir, output_file, metadata, cover_file):
                 if metadata['identifiers'].get('mobi-asin'):
                     f.write(f"asin={metadata['identifiers']['mobi-asin']}\n")
 
+            # If we have a mapping file, add a custom metadata field to reference it
+            if mapping_file and os.path.exists(mapping_file):
+                mapping_filename = os.path.basename(mapping_file)
+                f.write(f"comment=This audiobook includes text synchronization data: {mapping_filename}\n")
+
             # Add chapter markers
             for chapter in chapter_timestamps:
                 f.write("\n[CHAPTER]\n")
@@ -650,6 +838,12 @@ def assemble_audiobook_m4b(chapters_dir, output_file, metadata, cover_file):
         if process.returncode == 0:
             print(f"Successfully created M4B audiobook: {output_file}")
 
+            # If we have a mapping file, copy it to be alongside the final output
+            if mapping_file and os.path.exists(mapping_file):
+                mapping_dest = f"{os.path.splitext(output_file)[0]}_sync.json"
+                shutil.copy(mapping_file, mapping_dest)
+                print(f"Copied synchronization data to: {mapping_dest}")
+
             # Clean up temporary files
             os.remove(combined_audio_file)
             os.remove(metadata_file)
@@ -692,6 +886,240 @@ def combine_audio_chapters(chapter_files, output_file):
         print(f"Error combining chapter audio: {e}")
         return False
 
+def preprocess_chapter_with_llm(chapter_text, api_endpoint, api_key, model, max_chunk_size=4000):
+    """
+    Use LLM to preprocess chapter text for better TTS rendering.
+    Handles long chapters by splitting into manageable chunks.
+
+    Args:
+        chapter_text: The chapter text to preprocess
+        api_endpoint: API endpoint for the LLM
+        api_key: API key for authentication
+        model: LLM model to use
+        max_chunk_size: Maximum chunk size in characters
+
+    Returns:
+        Preprocessed chapter text optimized for TTS and properly split into sentences
+    """
+    # Construct the proper endpoint URL for chat completion
+    if api_endpoint.endswith('/v1'):
+        chat_endpoint = f"{api_endpoint}/chat/completions"
+    else:
+        chat_endpoint = f"{api_endpoint.rstrip('/')}/v1/chat/completions"
+
+    headers = {
+        'Authorization': f'Bearer {api_key}',
+        'Content-Type': 'application/json'
+    }
+
+    # Create the prompt for preprocessing with improved TTS safety
+    system_prompt = """You are a text preparation expert for text-to-speech (TTS) systems.
+    Your job is to format text for natural, high-quality audio narration while ensuring it's 100% TTS-safe.
+
+    Guidelines:
+    1. Properly split sentences at logical points where a narrator would pause
+    2. Convert Roman numerals to their spoken equivalent (e.g., "Chapter IV" → "Chapter 4")
+    3. Format numbers, dates, measurements, and currencies for natural reading
+    4. Handle abbreviations, acronyms, and special characters appropriately
+    5. Add strategic commas for natural pausing
+    6. Format dialog with appropriate attributions and pauses
+    7. Handle special textual elements like chapter headings, quotes, and lists
+
+    TTS SAFETY RULES (CRITICAL):
+    1. Normalize all quotation marks: Replace curly quotes (", ", ', ') with straight quotes (' and ")
+    2. Remove or replace problematic characters: \, `, |, *, ~, <, >, ^
+    3. Replace em dashes (—) with regular dashes (-) and add spaces around them
+    4. For dialog, verbalize quote indicators when needed: e.g., "open quote", "close quote"
+    5. Remove any HTML or XML-like tags that might remain in the text
+    6. Express mathematical formulas and equations in spoken form
+    7. Avoid consecutive punctuation marks (use only one)
+    8. Expand symbols like % and @ to "percent" and "at"
+    9. Ensure proper spacing after periods, commas, and other punctuation
+    10. Add a pause indicator (comma) before dialog attribution (e.g., "Hello," he said)
+    11. Ensure no unmatched brackets () [] {} remain in text
+
+    For each chunk of text I provide, return:
+    - Properly structured sentences, each on its own line
+    - Maintain paragraph breaks with blank lines
+    - Only return the processed text, no explanations
+    """
+
+    user_prompt = "Process this text for optimal text-to-speech narration. Split into proper sentences and format for natural speech, ensuring the text is completely safe for TTS processing:"
+
+    # Split long chapter into manageable chunks
+    chunks = []
+    paragraphs = re.split(r'\n\s*\n', chapter_text)
+    current_chunk = ""
+
+    for paragraph in paragraphs:
+        # If adding this paragraph would exceed our limit, finalize current chunk
+        if len(current_chunk) + len(paragraph) > max_chunk_size and current_chunk:
+            chunks.append(current_chunk)
+            current_chunk = paragraph
+        else:
+            if current_chunk:
+                current_chunk += "\n\n" + paragraph
+            else:
+                current_chunk = paragraph
+
+    # Add the last chunk if it exists
+    if current_chunk:
+        chunks.append(current_chunk)
+
+    processed_chunks = []
+    for i, chunk in enumerate(chunks):
+        print(f"Processing chunk {i+1}/{len(chunks)} ({len(chunk)} chars)...")
+
+        data = {
+            'model': model,
+            'messages': [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": f"{user_prompt}\n\n{chunk}"}
+            ],
+            'temperature': 0.3
+        }
+
+        try:
+            response = requests.post(chat_endpoint, headers=headers, json=data)
+
+            if response.status_code != 200:
+                print(f"LLM preprocessing error: {response.status_code} - {response.text}")
+                # Perform basic safety sanitization ourselves if LLM fails
+                safe_chunk = sanitize_for_tts(chunk)
+                processed_chunks.append(safe_chunk)
+                continue
+
+            result = response.json()
+            if 'choices' in result and len(result['choices']) > 0:
+                processed_text = result['choices'][0]['message']['content'].strip()
+                # Double-check safety of LLM output
+                processed_text = sanitize_for_tts(processed_text)
+                processed_chunks.append(processed_text)
+            else:
+                print("LLM returned unexpected response format")
+                safe_chunk = sanitize_for_tts(chunk)
+                processed_chunks.append(safe_chunk)
+
+        except Exception as e:
+            print(f"LLM preprocessing error: {e}")
+            safe_chunk = sanitize_for_tts(chunk)
+            processed_chunks.append(safe_chunk)
+
+    # Join processed chunks
+    processed_text = "\n\n".join(processed_chunks)
+
+    # Extract sentences and further split them into appropriate TTS chunks
+    raw_sentences = []
+    for paragraph in processed_text.split("\n\n"):
+        # Split on line breaks as these should now represent sentence boundaries
+        for line in paragraph.split("\n"):
+            line = line.strip()
+            if line:
+                raw_sentences.append(line)
+
+        # Add a small pause between paragraphs
+        if raw_sentences and raw_sentences[-1] != "":
+            raw_sentences.append("")
+
+    # Further split sentences into appropriately sized TTS chunks
+    final_sentences = []
+    current_tts_chunk = ""
+    sentence_count = 0
+
+    for sentence in raw_sentences:
+        # Estimate audio duration: ~3 words per second is typical narration speed
+        # Average English word is ~5 characters
+        estimated_duration = len(sentence) / 5 / 3  # in seconds
+
+        if sentence == "":  # Paragraph break
+            if current_tts_chunk:
+                final_sentences.append(current_tts_chunk)
+                current_tts_chunk = ""
+                sentence_count = 0
+            final_sentences.append("")
+            continue
+
+        # Start a new chunk if:
+        # 1. We already have 2 sentences OR
+        # 2. Adding this sentence would make the chunk too long (>30 seconds) OR
+        # 3. This single sentence is already very long (>20 seconds)
+        if (sentence_count >= 2) or \
+           (current_tts_chunk and estimated_duration > 20) or \
+           (len(current_tts_chunk) > 0 and len(current_tts_chunk) + len(sentence) > 800):  # ~800 chars ≈ 30 seconds
+
+            if current_tts_chunk:
+                final_sentences.append(current_tts_chunk)
+                current_tts_chunk = sentence
+                sentence_count = 1
+            else:
+                # If a single sentence is very long, we still need to include it
+                final_sentences.append(sentence)
+                sentence_count = 0
+                current_tts_chunk = ""
+        else:
+            # Add to current chunk
+            if current_tts_chunk:
+                current_tts_chunk += " " + sentence
+            else:
+                current_tts_chunk = sentence
+            sentence_count += 1
+
+    # Add any remaining text
+    if current_tts_chunk:
+        final_sentences.append(current_tts_chunk)
+
+    # Remove any trailing empty sentences
+    while final_sentences and not final_sentences[-1]:
+        final_sentences.pop()
+
+    # Ensure we don't have empty entries in the middle (convert to short pause indicator)
+    final_sentences = [s if s else "[PAUSE]" for s in final_sentences]
+
+    return final_sentences
+
+def sanitize_for_tts(text):
+    """
+    Perform basic sanitization of text to make it safer for TTS processing.
+    This is a fallback in case LLM processing fails.
+    """
+    # Normalize quotation marks
+    text = text.replace('"', '"').replace('"', '"')
+    text = text.replace(''', "'").replace(''', "'")
+
+    # Replace problematic characters
+    text = text.replace('\\', ' backslash ').replace('`', "'")
+    text = text.replace('|', ' or ').replace('*', ' star ')
+    text = text.replace('~', ' approximately ').replace('^', ' caret ')
+
+    # Fix dashes
+    text = text.replace('—', ' - ').replace('–', ' - ')
+
+    # Clean up excessive whitespace
+    text = re.sub(r'\s+', ' ', text)
+
+    # Fix spacing after punctuation
+    text = re.sub(r'([.,;:!?])(\w)', r'\1 \2', text)
+
+    # Remove HTML-like tags
+    text = re.sub(r'<[^>]+>', '', text)
+
+    # Ensure proper bracket pairing by removing unmatched brackets
+    # This is a simplistic approach - LLM does a better job at this
+    for bracket_pair in [('(', ')'), ('[', ']'), ('{', '}')]:
+        if text.count(bracket_pair[0]) != text.count(bracket_pair[1]):
+            text = text.replace(bracket_pair[0], ' ').replace(bracket_pair[1], ' ')
+
+    # Convert percentage symbols
+    text = re.sub(r'(\d+)%', r'\1 percent', text)
+
+    # Convert @ symbol
+    text = text.replace('@', ' at ')
+
+    # Clean up consecutive punctuation
+    text = re.sub(r'([.,;:!?]){2,}', r'\1', text)
+
+    return text.strip()
+
 
 def main():
     parser = argparse.ArgumentParser(description="Convert eBooks to audiobooks using OpenAI-compatible API")
@@ -707,6 +1135,9 @@ def main():
                         help=f"Maximum number of concurrent API requests (default: {DEFAULT_MAX_WORKERS})")
     parser.add_argument("--format", default="mp3", choices=["mp3", "wav", "ogg", "flac"],
                         help="Output format (default: mp3)")
+    parser.add_argument("--sync-text", action="store_true",
+                        help="Generate text-audio synchronization data for text highlighting")
+
 
     args = parser.parse_args()
 
@@ -747,13 +1178,23 @@ def main():
             print("No cover image found in the book")
 
         # Extract chapters and split into sentences
-        chapters = get_chapters(epub_book, dirs)
+        chapters = get_chapters(
+            epub_book,
+            dirs,
+            preprocess_llm=args.preprocess_llm,
+            api_endpoint=args.api_endpoint,
+            api_key=args.api_key,
+            preprocess_model=args.preprocess_model,
+            max_chunk_size=args.preprocess_max_chunk
+        )
 
         if not chapters:
             raise DependencyError("Failed to extract any chapters from the eBook")
 
         # Process chapters incrementally
         chapter_files = []
+        all_sentence_files = []  # Store all sentence files for mapping
+        all_sentences_data = []  # Store mapping between sentences and their text content
         current_sentence_num = 0
 
         # Process each chapter separately
@@ -772,6 +1213,16 @@ def main():
                 sentence_file = os.path.join(dirs["chapters_dir_sentences"],
                                             f"{current_sentence_num}.{default_audio_proc_format}")
                 chapter_audio_files.append((current_sentence_num, sentence, sentence_file))
+
+                # Store for mapping
+                all_sentence_files.append(sentence_file)
+                all_sentences_data.append({
+                    'chapter': chapter_num,
+                    'sentence_num': current_sentence_num,
+                    'text': sentence,
+                    'file': sentence_file
+                })
+
                 current_sentence_num += 1
 
             # Process sentences using thread pool
@@ -811,6 +1262,12 @@ def main():
             else:
                 print(f"  Failed to create chapter audio for Chapter {chapter_num}")
 
+        # Generate text-audio synchronization data if requested
+        mapping_file = None
+        if args.sync_text:
+            print("\nBuilding text-audio synchronization data...")
+            mapping_file = build_text_audio_mapping(chapters, all_sentences_data, dirs)
+
         # Create output audiobook file
         output_base = os.path.splitext(os.path.basename(args.input))[0]
         output_file = os.path.join(dirs["process_dir"], f"{output_base}.{args.format}")
@@ -822,10 +1279,14 @@ def main():
             output_file,
             metadata,
             cover_file,
+            mapping_file if args.sync_text else None
         )
 
         if final_audiobook:
             print(f"\nAudiobook created successfully: {final_audiobook}")
+            if mapping_file:
+                print(f"Text-audio synchronization data: {mapping_file}")
+                print("\nNote: To use text highlighting with audio playback, you'll need a compatible player that supports this mapping format.")
             return 0
         else:
             print("\nFailed to create audiobook with chapters")
