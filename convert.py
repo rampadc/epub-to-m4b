@@ -11,11 +11,13 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import json
 import zipfile
 
-from config import DEFAULT_API_ENDPOINT, DEFAULT_API_KEY, DEFAULT_MAX_WORKERS, DEFAULT_MODEL, default_audio_proc_format
+from config import DEFAULT_MAX_WORKERS, default_audio_proc_format
 from lib.assemble_audio import assemble_audiobook_m4b, build_text_audio_mapping, combine_audio_sentences
 from lib.media_overlay import add_media_overlay_to_epub
 from lib.preprocess import DependencyError, convert_to_epub, get_book_metadata, get_chapters, get_cover, prepare_dirs
 from lib.process import process_sentence
+from lib.tts import get_voices
+
 
 def get_chapter_num(filename):
     match = re.search(r'chapter_(\d+)', os.path.basename(filename))
@@ -116,39 +118,22 @@ def main():
     parser = argparse.ArgumentParser(description="Convert eBooks to audiobooks using OpenAI-compatible API")
     parser.add_argument("--input", "-i", required=True, help="Input eBook file")
     parser.add_argument("--output-dir", "-o", help="Output directory")
-    parser.add_argument("--api-endpoint", default=DEFAULT_API_ENDPOINT,
-                        help=f"OpenAI-compatible API endpoint (default: {DEFAULT_API_ENDPOINT})")
-    parser.add_argument("--api-key", default=DEFAULT_API_KEY,
-                        help=f"API key for authentication (default: {DEFAULT_API_KEY})")
-    parser.add_argument("--model", default=DEFAULT_MODEL, help=f"Model to use for TTS (default: {DEFAULT_MODEL})")
-    parser.add_argument("--max-tokens", type=int, default=250, help="Maximum tokens per sentence (default: 250)")
     parser.add_argument("--max-workers", type=int, default=DEFAULT_MAX_WORKERS,
                         help=f"Maximum number of concurrent API requests (default: {DEFAULT_MAX_WORKERS})")
     parser.add_argument("--format", default="m4b", choices=["mp3", "m4b", "wav", "ogg", "flac"],
                         help="Output format (default: mp3)")
     parser.add_argument("--sync-text", action="store_true",
                         help="Generate text-audio synchronization data for text highlighting")
-    parser.add_argument("--preprocess-llm", action="store_true",
-                        help="Use LLM to preprocess chapter text before TTS conversion")
-    parser.add_argument("--preprocess-model", default="mlx-community/Llama-3.2-1B-Instruct-4bit",
-                        help="Model to use for text preprocessing (default: mlx-community/Llama-3.2-1B-Instruct-4bit)")
-    parser.add_argument("--preprocess-max-chunk", type=int, default=4000,
-                        help="Maximum chunk size in characters for LLM preprocessing (default: 4000)")
-    parser.add_argument("--max-seconds-per-chunk", type=float, default=30.0,
-                       help="Maximum estimated length in seconds for TTS audio chunks (default: 30)")
-    parser.add_argument("--max-sentences-per-chunk", type=int, default=2,
-                       help="Maximum number of sentences per TTS chunk (default: 2)")
     parser.add_argument("--chapter-start", type=int, default=1,
                         help="Starting chapter number to process (default: 1)")
     parser.add_argument("--chapter-end", type=int, default=None,
                         help="Ending chapter number to process (inclusive, default: process all chapters)")
     parser.add_argument("--create-media-overlay", action="store_true",
-                        help="Create EPUB with media overlay (synchronized text and audio)")
+                        help="Not working: Create EPUB with media overlay (synchronized text and audio)")
+    parser.add_argument("--voice", default="af_heart", choices=get_voices(),
+                        help="Kokoro voices")
 
     args = parser.parse_args()
-
-    global max_tokens
-    max_tokens = args.max_tokens
 
     try:
         # Prepare directories
@@ -187,11 +172,6 @@ def main():
         chapters = get_chapters(
             epub_book,
             dirs,
-            preprocess_llm=args.preprocess_llm,
-            api_endpoint=args.api_endpoint,
-            api_key=args.api_key,
-            preprocess_model=args.preprocess_model,
-            max_chunk_size=args.preprocess_max_chunk
         )
 
         # Filter chapters based on start/end arguments if specified
@@ -262,7 +242,7 @@ def main():
 
                         future = executor.submit(
                             process_sentence,
-                            (sentence_num, sentence, sentence_file, args.api_endpoint, args.api_key, args.model)
+                            (sentence_num, sentence, sentence_file, args.voice)
                         )
                         futures.append(future)
 

@@ -2,7 +2,12 @@ import io
 from kokoro_onnx import Kokoro
 import soundfile as sf
 
-def get_audio(text):
+kokoro = Kokoro("kokoro-v1.0.onnx", "voices-v1.0.bin")
+
+def get_voices():
+    return kokoro.get_voices()
+
+def get_audio(text, voice):
     """Get audio using Kokoro TTS
 
     Args:
@@ -12,11 +17,8 @@ def get_audio(text):
         bytes: Audio content as WAV bytes or None if generation failed
     """
     try:
-        # Initialize Kokoro
-        kokoro = Kokoro("kokoro-v1.0.onnx", "voices-v1.0.bin")
-
         # Generate audio
-        samples, sample_rate = kokoro.create(text, "af_heart", is_phonemes=False)
+        samples, sample_rate = kokoro.create(text, voice, is_phonemes=False)
 
         if len(samples) == 0:
             print("Error in generating audio")

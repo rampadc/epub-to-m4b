@@ -221,8 +221,7 @@ def normalize_text(text):
 
     return text
 
-def get_chapters(epub_book, dirs, preprocess_llm=False, api_endpoint=None, api_key=None,
-                preprocess_model=None, max_chunk_size=1000, max_sentences=2, max_seconds=10.0):
+def get_chapters(epub_book, dirs):
     """Extract chapters from EPUB and split into sentences"""
     try:
         all_docs = list(epub_book.get_items_of_type(ebooklib.ITEM_DOCUMENT))
