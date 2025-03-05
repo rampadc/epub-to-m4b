@@ -1147,6 +1147,10 @@ def main():
                        help="Maximum estimated length in seconds for TTS audio chunks (default: 30)")
     parser.add_argument("--max-sentences-per-chunk", type=int, default=2,
                        help="Maximum number of sentences per TTS chunk (default: 2)")
+    parser.add_argument("--chapter-start", type=int, default=1,
+                        help="Starting chapter number to process (default: 1)")
+    parser.add_argument("--chapter-end", type=int, default=None,
+                        help="Ending chapter number to process (inclusive, default: process all chapters)")
 
     args = parser.parse_args()
 
@@ -1197,6 +1201,24 @@ def main():
             max_chunk_size=args.preprocess_max_chunk
         )
 
+        # Filter chapters based on start/end arguments if specified
+        if args.chapter_start > 1 or args.chapter_end is not None:
+            original_chapter_count = len(chapters)
+            start_idx = args.chapter_start - 1  # Convert to 0-based index
+            end_idx = args.chapter_end if args.chapter_end is not None else len(chapters)
+
+            # Validate chapter range
+            if start_idx < 0 or start_idx >= len(chapters):
+                print(f"Error: Starting chapter {args.chapter_start} is out of range (book has {len(chapters)} chapters)")
+                return 1
+            if end_idx > len(chapters):
+                print(f"Warning: Ending chapter {args.chapter_end} exceeds available chapters. Using last chapter ({len(chapters)}) instead.")
+                end_idx = len(chapters)
+
+            # Select only the specified chapters
+            chapters = chapters[start_idx:end_idx]
+            print(f"Processing chapters {args.chapter_start} to {end_idx} (out of {original_chapter_count} total chapters)")
+
         if not chapters:
             raise DependencyError("Failed to extract any chapters from the eBook")
 
@@ -1207,7 +1229,8 @@ def main():
         current_sentence_num = 0
 
         # Process each chapter separately
-        for chapter_num, sentences in enumerate(chapters, 1):
+        for chapter_idx, sentences in enumerate(chapters):
+            chapter_num = chapter_idx + args.chapter_start
             valid_sentences = [s for s in sentences if s.strip()]
             if not valid_sentences:
                 continue
