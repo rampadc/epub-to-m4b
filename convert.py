@@ -1137,7 +1137,16 @@ def main():
                         help="Output format (default: mp3)")
     parser.add_argument("--sync-text", action="store_true",
                         help="Generate text-audio synchronization data for text highlighting")
-
+    parser.add_argument("--preprocess-llm", action="store_true",
+                        help="Use LLM to preprocess chapter text before TTS conversion")
+    parser.add_argument("--preprocess-model", default="mlx-community/Llama-3.2-1B-Instruct-4bit",
+                        help="Model to use for text preprocessing (default: mlx-community/Llama-3.2-1B-Instruct-4bit)")
+    parser.add_argument("--preprocess-max-chunk", type=int, default=4000,
+                        help="Maximum chunk size in characters for LLM preprocessing (default: 4000)")
+    parser.add_argument("--max-seconds-per-chunk", type=float, default=30.0,
+                       help="Maximum estimated length in seconds for TTS audio chunks (default: 30)")
+    parser.add_argument("--max-sentences-per-chunk", type=int, default=2,
+                       help="Maximum number of sentences per TTS chunk (default: 2)")
 
     args = parser.parse_args()
 
