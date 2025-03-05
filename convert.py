@@ -20,12 +20,12 @@ tmp_dir = "tmp"
 punctuation_list = ['.', ',', '!', '?', ':', ';', '"', "'", '(', ')', '[', ']', '{', '}', '/', '\\', '-', '–', '—', '…']
 switch_punctuations = {"'": "'", "'": "'", """: '"', """: '"', "„": '"', "‚": "'", "‟": '"', "′": "'", "″": '"'}
 default_audio_proc_format = "wav"
-max_tokens = 10  # Default max tokens per sentence
+max_tokens = 5  # Default max tokens per sentence
 
 DEFAULT_API_ENDPOINT = "http://localhost:10240/v1"
 DEFAULT_API_KEY = "xxxx"
 DEFAULT_MODEL = "mlx-community/Kokoro-82M-bf16"
-DEFAULT_MAX_WORKERS = 8  # Default number of concurrent threads
+DEFAULT_MAX_WORKERS = 16  # Default number of concurrent threads
 
 class DependencyError(Exception):
     def __init__(self, message=None):
@@ -238,7 +238,7 @@ def normalize_text(text):
 
 
 def get_chapters(epub_book, dirs, preprocess_llm=False, api_endpoint=None, api_key=None,
-                preprocess_model=None, max_chunk_size=4000, max_sentences=2, max_seconds=30.0):
+                preprocess_model=None, max_chunk_size=1000, max_sentences=2, max_seconds=10.0):
     """Extract chapters from EPUB and split into sentences"""
     try:
         all_docs = list(epub_book.get_items_of_type(ebooklib.ITEM_DOCUMENT))
@@ -362,15 +362,18 @@ def filter_chapter(doc):
 
 def get_sentences(phoneme_list, max_tokens):
     """
-    Split a list of phonemes into proper sentences first, then respect token limits.
+    Split a list of phonemes into proper sentences first, then respect character limits.
 
     Args:
         phoneme_list: A list of text fragments typically ending with punctuation
-        max_tokens: Maximum number of tokens (words) allowed per sentence
+        max_tokens: Not used, kept for backward compatibility
 
     Returns:
-        A list of sentences
+        A list of sentences limited to 500 characters each
     """
+    # Maximum characters per chunk
+    max_chars = 500
+
     # First, join all phonemes to get the complete text
     complete_text = ' '.join(phoneme_list)
 
@@ -379,36 +382,42 @@ def get_sentences(phoneme_list, max_tokens):
     sentence_pattern = r'(?<=[.!?])\s+(?=[A-Z]|$)'
     raw_sentences = re.split(sentence_pattern, complete_text)
 
-    # Further refine sentences to respect max token limit
+    # Further refine sentences to respect character limit
     final_sentences = []
     for sentence in raw_sentences:
         sentence = sentence.strip()
         if not sentence:
             continue
 
-        # Split long sentences based on token count
-        words = sentence.split()
-        if len(words) <= max_tokens:
+        # If sentence is already short enough, add it directly
+        if len(sentence) <= max_chars:
             final_sentences.append(sentence)
         else:
-            # Process sentences that exceed max token count
-            current_chunk = []
-            current_token_count = 0
+            # Process sentences that exceed character limit
+            # Try to break at logical points like commas, semicolons, etc.
+            chunk_start = 0
 
-            for word in words:
-                if current_token_count + 1 > max_tokens:
-                    # Add current chunk as a sentence
-                    final_sentences.append(' '.join(current_chunk))
-                    # Start a new chunk
-                    current_chunk = [word]
-                    current_token_count = 1
-                else:
-                    current_chunk.append(word)
-                    current_token_count += 1
+            while chunk_start < len(sentence):
+                # Try to find a good breaking point near the character limit
+                chunk_end = min(chunk_start + max_chars, len(sentence))
 
-            # Add the last chunk if it exists
-            if current_chunk:
-                final_sentences.append(' '.join(current_chunk))
+                # If we're not at the end of the sentence, try to find a natural breaking point
+                if chunk_end < len(sentence):
+                    # Look for the last punctuation or space before the limit
+                    breaking_points = [sentence.rfind(c, chunk_start, chunk_end) for c in ['. ', ', ', '; ', ' ']]
+                    best_break = max(breaking_points)
+
+                    # If found a good breaking point, use it
+                    if best_break > chunk_start:
+                        chunk_end = best_break + 1  # Include the breaking character
+
+                # Extract the chunk and add it to final sentences
+                chunk = sentence[chunk_start:chunk_end].strip()
+                if chunk:
+                    final_sentences.append(chunk)
+
+                # Move to the next chunk
+                chunk_start = chunk_end
 
     return final_sentences
 
@@ -1133,7 +1142,7 @@ def main():
     parser.add_argument("--max-tokens", type=int, default=250, help="Maximum tokens per sentence (default: 250)")
     parser.add_argument("--max-workers", type=int, default=DEFAULT_MAX_WORKERS,
                         help=f"Maximum number of concurrent API requests (default: {DEFAULT_MAX_WORKERS})")
-    parser.add_argument("--format", default="mp3", choices=["mp3", "wav", "ogg", "flac"],
+    parser.add_argument("--format", default="m4b", choices=["mp3", "m4b", "wav", "ogg", "flac"],
                         help="Output format (default: mp3)")
     parser.add_argument("--sync-text", action="store_true",
                         help="Generate text-audio synchronization data for text highlighting")
@@ -1304,24 +1313,65 @@ def main():
         output_base = os.path.splitext(os.path.basename(args.input))[0]
         output_file = os.path.join(dirs["process_dir"], f"{output_base}.{args.format}")
 
-        # Assemble final audiobook with chapters
-        print("\nAssembling final audiobook with chapters...")
-        final_audiobook = assemble_audiobook_m4b(
-            dirs["chapters_dir"],
-            output_file,
-            metadata,
-            cover_file,
-            mapping_file if args.sync_text else None
-        )
+        # Assemble final audiobook based on format
+        if args.format.lower() == "m4b":
+            # Assemble as M4B with chapter markers
+            print("\nAssembling final audiobook with chapters (M4B format)...")
+            final_audiobook = assemble_audiobook_m4b(
+                dirs["chapters_dir"],
+                output_file,
+                metadata,
+                cover_file,
+                mapping_file if args.sync_text else None
+            )
+        else:
+            # Assemble as MP3 or other format using PyDub
+            print(f"\nAssembling final audiobook ({args.format.upper()} format)...")
+            # Ensure output file has correct extension
+            output_file = f"{os.path.splitext(output_file)[0]}.{args.format}"
 
-        if final_audiobook:
+            # Combine all chapter files
+            combined = AudioSegment.empty()
+
+            # Sort chapter files by chapter number
+            def get_chapter_num(filename):
+                match = re.search(r'chapter_(\d+)', os.path.basename(filename))
+                if match:
+                    return int(match.group(1))
+                return float('inf')
+
+            chapter_files.sort(key=get_chapter_num)
+
+            print(f"Combining {len(chapter_files)} chapters...")
+            for chapter_file in tqdm(chapter_files):
+                if os.path.exists(chapter_file):
+                    chapter_audio = AudioSegment.from_file(chapter_file, format=default_audio_proc_format)
+                    combined += chapter_audio
+
+            # Set bitrate based on format
+            bitrate = "128k"  # Default for MP3
+            if args.format == "flac":
+                # FLAC is lossless so bitrate isn't specified the same way
+                combined.export(output_file, format=args.format)
+            else:
+                combined.export(output_file, format=args.format, bitrate=bitrate)
+
+            # If we have a mapping file, copy it alongside the output
+            if mapping_file and os.path.exists(mapping_file):
+                mapping_dest = f"{os.path.splitext(output_file)[0]}_sync.json"
+                shutil.copy(mapping_file, mapping_dest)
+                print(f"Copied synchronization data to: {mapping_dest}")
+
+            final_audiobook = output_file
+
+        if final_audiobook and os.path.exists(final_audiobook):
             print(f"\nAudiobook created successfully: {final_audiobook}")
             if mapping_file:
                 print(f"Text-audio synchronization data: {mapping_file}")
                 print("\nNote: To use text highlighting with audio playback, you'll need a compatible player that supports this mapping format.")
             return 0
         else:
-            print("\nFailed to create audiobook with chapters")
+            print("\nFailed to create audiobook")
             return 1
 
     except DependencyError as e:
