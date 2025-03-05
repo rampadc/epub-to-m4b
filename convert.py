@@ -16,6 +16,13 @@ from lib.media_overlay import add_media_overlay_to_epub
 from lib.preprocess import DependencyError, convert_to_epub, get_book_metadata, get_chapters, get_cover, prepare_dirs
 from lib.process import process_sentence
 
+def get_chapter_num(filename):
+    match = re.search(r'chapter_(\d+)', os.path.basename(filename))
+    if match:
+        return int(match.group(1))
+    return float('inf')
+
+
 def main():
     parser = argparse.ArgumentParser(description="Convert eBooks to audiobooks using OpenAI-compatible API")
     parser.add_argument("--input", "-i", required=True, help="Input eBook file")
@@ -212,11 +219,7 @@ def main():
             combined = AudioSegment.empty()
 
             # Sort chapter files by chapter number
-            def get_chapter_num(filename):
-                match = re.search(r'chapter_(\d+)', os.path.basename(filename))
-                if match:
-                    return int(match.group(1))
-                return float('inf')
+
 
             chapter_files.sort(key=get_chapter_num)
 
@@ -285,13 +288,6 @@ def main():
                 # Combine all chapter files
                 combined = AudioSegment.empty()
 
-                # Sort chapter files by chapter number
-                def get_chapter_num(filename):
-                    match = re.search(r'chapter_(\d+)', os.path.basename(filename))
-                    if match:
-                        return int(match.group(1))
-                    return float('inf')
-
                 chapter_files.sort(key=get_chapter_num)
 
                 print(f"Combining {len(chapter_files)} chapters...")
@@ -324,7 +320,7 @@ def main():
                 print("\nFailed to create audiobook")
                 return 1
 
-    except DependencyError as e:
+    except DependencyError:
         # Already handled in the exception
         return 1
     except Exception as e:

@@ -8,6 +8,12 @@ from pydub.audio_segment import AudioSegment
 from tqdm import tqdm
 from config import default_audio_proc_format
 
+def get_chapter_num(filename):
+    match = re.search(r'chapter_(\d+)', os.path.basename(filename))
+    if match:
+        return int(match.group(1))
+    # Default to a large number for any files without proper naming
+    return float('inf')
 
 def combine_audio_sentences(sentence_files, output_file):
     """Combine sentence audio files into a chapter file using PyDub"""
@@ -160,14 +166,6 @@ def assemble_audiobook_m4b(chapters_dir, output_file, metadata, cover_file, mapp
         if not chapter_files:
             print("No chapter files found!")
             return None
-
-        # Sort chapter files numerically using our safer function
-        def get_chapter_num(filename):
-            match = re.search(r'chapter_(\d+)', os.path.basename(filename))
-            if match:
-                return int(match.group(1))
-            # Default to a large number for any files without proper naming
-            return float('inf')
 
         chapter_files.sort(key=get_chapter_num)
 
@@ -342,13 +340,6 @@ def combine_audio_chapters(chapter_files, output_file):
         combined = AudioSegment.empty()
 
         # Sort chapter files by chapter number in a more robust way
-        def get_chapter_num(filename):
-            match = re.search(r'chapter_(\d+)', filename)
-            if match:
-                return int(match.group(1))
-            # Default to a large number for any files without proper naming
-            return float('inf')
-
         for file in sorted(chapter_files, key=get_chapter_num):
             if os.path.exists(file):
                 audio = AudioSegment.from_file(file, format=default_audio_proc_format)
