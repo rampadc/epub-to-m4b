@@ -22,7 +22,9 @@ def process_sentence(sentence_data):
         return sentence_num, sentence_file, True
 
     # Get audio from API
-    audio_data = get_audio(sentence, api_endpoint, api_key, model)
+    audio_data = get_audio(
+        text=sentence
+    )
 
     if audio_data:
         # Save the audio file

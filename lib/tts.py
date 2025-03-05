@@ -1,33 +1,38 @@
-import requests
+import io
+from kokoro_onnx import Kokoro
+import soundfile as sf
 
+def get_audio(text):
+    """Get audio using Kokoro TTS
 
-def get_audio(text, api_endpoint, api_key, model):
-    """Get audio from OpenAI-compatible API"""
-    # Construct the proper endpoint URL for audio generation
-    if api_endpoint.endswith('/v1'):
-        api_endpoint = f"{api_endpoint}/audio/speech"
-    elif not api_endpoint.endswith('/audio/speech'):
-        api_endpoint = f"{api_endpoint.rstrip('/')}/v1/audio/speech"
+    Args:
+        text (str): Text to convert to speech
 
-    headers = {
-        'Authorization': f'Bearer {api_key}',
-        'Content-Type': 'application/json'
-    }
-
-    data = {
-        'model': model,
-        'input': text
-    }
-
+    Returns:
+        bytes: Audio content as WAV bytes or None if generation failed
+    """
     try:
-        response = requests.post(api_endpoint, headers=headers, json=data)
+        # Initialize Kokoro
+        kokoro = Kokoro("kokoro-v1.0.onnx", "voices-v1.0.bin")
 
-        if response.status_code != 200:
-            print(f"API error: {response.status_code} - {response.text}")
+        # Generate audio
+        samples, sample_rate = kokoro.create(text, "af_heart", is_phonemes=False)
+
+        if len(samples) == 0:
+            print("Error in generating audio")
             return None
 
-        # Return the audio content
-        return response.content
+        # Convert numpy array to WAV bytes
+        with io.BytesIO() as wav_io:
+            sf.write(
+                wav_io,
+                samples,
+                samplerate=sample_rate,
+                format='WAV',
+                subtype='PCM_16'
+            )
+            return wav_io.getvalue()
+
     except Exception as e:
-        print(f"API request error: {e}")
+        print(f"Kokoro TTS error: {e}")
         return None
