@@ -1,37 +1,42 @@
 import os
-import re
-import shutil
 import argparse
 import sys
-from ebooklib import epub
-from pydub import AudioSegment
-from tqdm import tqdm
-import traceback
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import shutil
 import json
-import zipfile
+import logging
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
+from tqdm import tqdm
 
 from config import DEFAULT_MAX_WORKERS, default_audio_proc_format
-from lib.assemble_audio import assemble_audiobook_m4b, build_text_audio_mapping, combine_audio_sentences
+from lib.preprocess import DependencyError, convert_to_epub, get_book_metadata, get_cover, prepare_dirs
+from lib.chapter_manager import ChapterManager
+from lib.assemble_audio import assemble_audiobook_m4b, build_text_audio_mapping
 from lib.media_overlay import add_media_overlay_to_epub
-from lib.preprocess import DependencyError, convert_to_epub, get_book_metadata, get_chapters, get_cover, prepare_dirs
 from lib.process import process_sentence
 from lib.tts import get_voices
 
-
-def get_chapter_num(filename):
-    match = re.search(r'chapter_(\d+)', os.path.basename(filename))
-    if match:
-        return int(match.group(1))
-    return float('inf')
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+log = logging.getLogger("epub2audiobook")
 
 def read_epub_safely(epub_path):
+    """
+    Safely read an EPUB file, attempting to fix common issues if needed.
+    """
+    from ebooklib import epub
+    import zipfile
+    import re
+
     common_missing_files = [
-            'page_styles.css',
-            'stylesheet.css',
-            'style.css',
-            'styles.css'
-        ]
+        'page_styles.css',
+        'stylesheet.css',
+        'style.css',
+        'styles.css'
+    ]
 
     # First, proactively add all potentially missing files
     try:
@@ -40,10 +45,10 @@ def read_epub_safely(epub_path):
 
             for css_file in common_missing_files:
                 if css_file not in existing_files:
-                    print(f"Adding missing {css_file} to EPUB file...")
+                    log.info(f"Adding missing {css_file} to EPUB file...")
                     epub_zip.writestr(css_file, '/* Empty CSS file */')
     except Exception as e:
-        print(f"Warning: Could not preemptively fix EPUB file: {e}")
+        log.warning(f"Could not preemptively fix EPUB file: {e}")
         # Continue anyway, we'll try to read the file as is
 
     # Now try to read the EPUB
@@ -51,26 +56,23 @@ def read_epub_safely(epub_path):
         return epub.read_epub(epub_path, {'ignore_ncx': True})
     except KeyError as e:
         # Extract the missing file name from the error
-        import re
         missing_file_match = re.search(r"'([^']*)'", str(e))
         if missing_file_match:
             missing_file = missing_file_match.group(1)
-            print(f"Warning: EPUB file is missing '{missing_file}'. Attempting to fix...")
+            log.warning(f"EPUB file is missing '{missing_file}'. Attempting to fix...")
 
             try:
                 # Try to add the specific missing file
                 with zipfile.ZipFile(epub_path, 'a') as epub_zip:
                     epub_zip.writestr(missing_file, '/* Empty file */')
-                print(f"Added missing file: {missing_file}. Trying to read EPUB again...")
+                log.info(f"Added missing file: {missing_file}. Trying to read EPUB again...")
                 return epub.read_epub(epub_path, {'ignore_ncx': True})
             except Exception as fix_error:
-                print(f"Error while fixing EPUB: {fix_error}")
+                log.error(f"Error while fixing EPUB: {fix_error}")
                 # If we still can't read it, try a more drastic approach
                 try:
-                    print("Attempting to extract and repackage the EPUB...")
+                    log.info("Attempting to extract and repackage the EPUB...")
                     import tempfile
-                    import os
-                    import shutil
 
                     # Create a temporary directory
                     temp_dir = tempfile.mkdtemp()
@@ -97,31 +99,30 @@ def read_epub_safely(epub_path):
 
                         # Replace the original with the fixed version
                         shutil.move(temp_epub, epub_path)
-                        print("EPUB file has been repackaged. Trying to read again...")
+                        log.info("EPUB file has been repackaged. Trying to read again...")
 
                         return epub.read_epub(epub_path, {'ignore_ncx': True})
                     finally:
                         # Clean up the temporary directory
                         shutil.rmtree(temp_dir)
                 except Exception as repackage_error:
-                    print(f"Error while repackaging EPUB: {repackage_error}")
+                    log.error(f"Error while repackaging EPUB: {repackage_error}")
                     raise e
         else:
             # For other KeyError issues, just raise the original error
             raise
     except Exception as e:
-        print(f"Error reading EPUB file: {e}")
+        log.error(f"Error reading EPUB file: {e}")
         raise
 
-
 def main():
-    parser = argparse.ArgumentParser(description="Convert eBooks to audiobooks using OpenAI-compatible API")
+    parser = argparse.ArgumentParser(description="Convert eBooks to audiobooks using Kokoro TTS")
     parser.add_argument("--input", "-i", required=True, help="Input eBook file")
     parser.add_argument("--output-dir", "-o", help="Output directory")
     parser.add_argument("--max-workers", type=int, default=DEFAULT_MAX_WORKERS,
-                        help=f"Maximum number of concurrent API requests (default: {DEFAULT_MAX_WORKERS})")
+                        help=f"Maximum number of concurrent audio processing tasks (default: {DEFAULT_MAX_WORKERS})")
     parser.add_argument("--format", default="m4b", choices=["mp3", "m4b", "wav", "ogg", "flac"],
-                        help="Output format (default: mp3)")
+                        help="Output format (default: m4b)")
     parser.add_argument("--sync-text", action="store_true",
                         help="Generate text-audio synchronization data for text highlighting")
     parser.add_argument("--chapter-start", type=int, default=1,
@@ -129,272 +130,202 @@ def main():
     parser.add_argument("--chapter-end", type=int, default=None,
                         help="Ending chapter number to process (inclusive, default: process all chapters)")
     parser.add_argument("--create-media-overlay", action="store_true",
-                        help="Not working: Create EPUB with media overlay (synchronized text and audio)")
+                        help="Create EPUB with media overlay (synchronized text and audio)")
     parser.add_argument("--voice", default="af_heart", choices=get_voices(),
-                        help="Kokoro voices")
+                        help="Kokoro voice to use")
+    parser.add_argument("--voice-map", help="JSON file mapping chapter numbers to specific voices")
 
     args = parser.parse_args()
 
     try:
         # Prepare directories
         dirs = prepare_dirs(args.input, args.output_dir)
+        process_dir = Path(dirs["process_dir"])
 
         # Convert to EPUB if needed
         if not args.input.lower().endswith('.epub'):
-            print("Converting input file to EPUB format...")
+            log.info("Converting input file to EPUB format...")
             convert_to_epub(dirs["ebook"], dirs["epub_path"])
         else:
             # If input is already EPUB, just copy it
-            input_path = os.path.abspath(args.input)
-            epub_path = os.path.abspath(dirs["epub_path"])
+            input_path = Path(args.input).absolute()
+            epub_path = Path(dirs["epub_path"]).absolute()
 
             if input_path != epub_path:
                 shutil.copy(input_path, epub_path)
 
             # Always use the file in the processing directory
-            dirs["epub_path"] = epub_path
+            dirs["epub_path"] = str(epub_path)
 
         # Read the EPUB
-        print("Reading EPUB content...")
+        log.info("Reading EPUB content...")
         epub_book = read_epub_safely(dirs["epub_path"])
 
         # Extract metadata and cover
-        print("Extracting book metadata...")
+        log.info("Extracting book metadata...")
         metadata = get_book_metadata(epub_book)
         cover_file = get_cover(epub_book, dirs["process_dir"])
 
         if cover_file:
-            print(f"Extracted cover: {cover_file}")
+            log.info(f"Extracted cover: {cover_file}")
         else:
-            print("No cover image found in the book")
+            log.warning("No cover image found in the book")
 
-        # Extract chapters and split into sentences
-        chapters = get_chapters(
-            epub_book,
-            dirs,
-        )
+        # Initialize the ChapterManager
+        log.info("Initializing chapter manager...")
+        chapter_manager = ChapterManager(dirs["epub_path"], process_dir, args.voice)
+        chapter_manager.prepare_directories()
+
+        # Load voice map if provided
+        voice_map = {}
+        if args.voice_map and os.path.exists(args.voice_map):
+            try:
+                with open(args.voice_map, 'r') as f:
+                    voice_map = json.load(f)
+                log.info(f"Loaded voice map from {args.voice_map}")
+            except Exception as e:
+                log.error(f"Error loading voice map: {e}")
 
         # Filter chapters based on start/end arguments if specified
+        chapter_count = len(chapter_manager.chapter_data)
         if args.chapter_start > 1 or args.chapter_end is not None:
-            original_chapter_count = len(chapters)
-            start_idx = args.chapter_start - 1  # Convert to 0-based index
-            end_idx = args.chapter_end if args.chapter_end is not None else len(chapters)
+            start_chapter = args.chapter_start
+            end_chapter = args.chapter_end if args.chapter_end is not None else chapter_count
 
             # Validate chapter range
-            if start_idx < 0 or start_idx >= len(chapters):
-                print(f"Error: Starting chapter {args.chapter_start} is out of range (book has {len(chapters)} chapters)")
+            if start_chapter < 1 or start_chapter > chapter_count:
+                log.error(f"Starting chapter {start_chapter} is out of range (book has {chapter_count} chapters)")
                 return 1
-            if end_idx > len(chapters):
-                print(f"Warning: Ending chapter {args.chapter_end} exceeds available chapters. Using last chapter ({len(chapters)}) instead.")
-                end_idx = len(chapters)
 
-            # Select only the specified chapters
-            chapters = chapters[start_idx:end_idx]
-            print(f"Processing chapters {args.chapter_start} to {end_idx} (out of {original_chapter_count} total chapters)")
+            if end_chapter > chapter_count:
+                log.warning(f"Ending chapter {end_chapter} exceeds available chapters. Using last chapter ({chapter_count}) instead.")
+                end_chapter = chapter_count
 
-        if not chapters:
+            log.info(f"Processing chapters {start_chapter} to {end_chapter} (out of {chapter_count} total chapters)")
+
+            # Filter chapter_data to only include the specified range
+            chapter_manager.chapter_data = [ch for ch in chapter_manager.chapter_data
+                                          if start_chapter <= ch['number'] <= end_chapter]
+        else:
+            log.info(f"Processing all {chapter_count} chapters")
+
+        if not chapter_manager.chapter_data:
             raise DependencyError("Failed to extract any chapters from the eBook")
 
-        # Process chapters incrementally
-        chapter_files = []
-        all_sentence_files = []  # Store all sentence files for mapping
-        all_sentences_data = []  # Store mapping between sentences and their text content
-        current_sentence_num = 0
+        # Get all sentence data for processing
+        all_sentence_data = chapter_manager.get_all_sentence_data(voice_map)
 
-        # Process each chapter separately
-        for chapter_idx, sentences in enumerate(chapters):
-            chapter_num = chapter_idx + args.chapter_start
-            valid_sentences = [s for s in sentences if s.strip()]
-            if not valid_sentences:
-                continue
+        # Process all sentences using thread pool
+        log.info(f"Processing {len(all_sentence_data)} sentences with {args.max_workers} workers...")
+        with tqdm(total=len(all_sentence_data), desc="Processing", unit="sentence") as progress_bar:
+            with ThreadPoolExecutor(max_workers=args.max_workers) as executor:
+                futures = []
 
-            print(f"\nProcessing Chapter {chapter_num} with {len(valid_sentences)} sentences...")
-
-            # Process this chapter's sentences and get audio files
-            chapter_audio_files = []
-
-            for sentence in valid_sentences:
-                # Filename for this sentence
-                sentence_file = os.path.join(dirs["chapters_dir_sentences"],
-                                            f"{current_sentence_num}.{default_audio_proc_format}")
-                chapter_audio_files.append((current_sentence_num, sentence, sentence_file))
-
-                # Store for mapping
-                all_sentence_files.append(sentence_file)
-                all_sentences_data.append({
-                    'chapter': chapter_num,
-                    'sentence_num': current_sentence_num,
-                    'text': sentence,
-                    'file': sentence_file
-                })
-
-                current_sentence_num += 1
-
-            # Process sentences using thread pool
-            with tqdm(total=len(chapter_audio_files), desc=f"Chapter {chapter_num}", unit="sentence") as progress_bar:
-                with ThreadPoolExecutor(max_workers=args.max_workers) as executor:
-                    futures = []
-
-                    for sentence_num, sentence, sentence_file in chapter_audio_files:
-                        if os.path.exists(sentence_file):
-                            progress_bar.update(1)
-                            continue
-
-                        future = executor.submit(
-                            process_sentence,
-                            (sentence_num, sentence, sentence_file, args.voice)
-                        )
-                        futures.append(future)
-
-                    for future in as_completed(futures):
-                        try:
-                            _, _, success = future.result()
-                            if not success:
-                                print(f"\nFailed to process a sentence in Chapter {chapter_num}")
-                        except Exception as exc:
-                            print(f"\nError processing sentence: {exc}")
-
+                for sentence_info in all_sentence_data:
+                    if sentence_info['file'].exists():
                         progress_bar.update(1)
+                        continue
 
-            # Combine this chapter's sentences into a chapter file
-            sentence_files = [s[2] for s in chapter_audio_files]
-            chapter_file = os.path.join(dirs["chapters_dir"], f"chapter_{chapter_num}.{default_audio_proc_format}")
+                    future = executor.submit(process_sentence, sentence_info)
+                    futures.append(future)
 
-            print(f"Combining sentences for Chapter {chapter_num}...")
-            if combine_audio_sentences(sentence_files, chapter_file):
-                chapter_files.append(chapter_file)
-                print(f"  Created chapter audio: {chapter_file}")
-            else:
-                print(f"  Failed to create chapter audio for Chapter {chapter_num}")
+                for future in as_completed(futures):
+                    try:
+                        result = future.result()
+                        if result and not result[2]:  # Check if processing was successful
+                            log.warning(f"Failed to process sentence {result[0]}")
+                    except Exception as exc:
+                        log.error(f"Error processing sentence: {exc}")
+                    progress_bar.update(1)
 
-        # Generate text-audio synchronization data
-        print("\nBuilding text-audio synchronization data...")
-        mapping_file = build_text_audio_mapping(chapters, all_sentences_data, dirs)
+        # Combine sentences into chapters
+        log.info("Combining sentences into chapters...")
+        for chapter_info in tqdm(chapter_manager.chapter_data, desc="Creating chapters"):
+            chapter_num = chapter_info['number']
+            chapter_manager.combine_sentences_to_chapter(chapter_num)
+
+        # Generate text-audio mapping for synchronization
+        log.info("Building text-audio synchronization data...")
+        mapping_file = build_text_audio_mapping(chapter_manager, all_sentence_data)
 
         if not mapping_file:
-            raise Exception("Failed to create text-audio synchronization mapping")
+            log.error("Failed to create text-audio synchronization mapping")
+            return 1
 
-        output_base = os.path.splitext(os.path.basename(args.input))[0]
+        output_base = Path(args.input).stem
+        output_file = process_dir / f"{output_base}.{args.format}"
 
         # Determine output mode based on media overlay setting
         if args.create_media_overlay:
-            # Media overlay mode - only create EPUB with embedded audio
-            print("\nMedia overlay mode: Creating EPUB with synchronized audio...")
-
+            log.info("Creating EPUB with media overlay (synchronized text and audio)...")
             # First create a temporary MP3 file for embedding in the EPUB
-            temp_mp3_file = os.path.join(dirs["process_dir"], "temp_audiobook.mp3")
+            temp_mp3_file = process_dir / "temp_audiobook.mp3"
 
-            # Combine all chapter files into an MP3
-            combined = AudioSegment.empty()
+            # Create a temporary audiobook in MP3 format
+            mp3_output = assemble_audiobook_m4b(
+                chapter_manager,
+                temp_mp3_file.with_suffix('.m4b'),
+                metadata,
+                cover_file
+            )
 
-            # Sort chapter files by chapter number
-
-
-            chapter_files.sort(key=get_chapter_num)
-
-            print(f"Combining {len(chapter_files)} chapters for EPUB audio...")
-            for chapter_file in tqdm(chapter_files):
-                if os.path.exists(chapter_file):
-                    chapter_audio = AudioSegment.from_file(chapter_file, format=default_audio_proc_format)
-                    combined += chapter_audio
-
-            # Export as MP3 for embedding in EPUB
-            combined.export(temp_mp3_file, format="mp3", bitrate="128k")
-            print(f"Created temporary MP3 file for EPUB: {temp_mp3_file}")
+            if not mp3_output:
+                log.error("Failed to create temporary audiobook")
+                return 1
 
             # Update mapping file with the MP3 file path
             try:
                 with open(mapping_file, 'r', encoding='utf-8') as f:
                     sync_data = json.load(f)
 
-                sync_data["audio_file"] = temp_mp3_file
+                sync_data["audio_file"] = str(temp_mp3_file)
 
                 with open(mapping_file, 'w', encoding='utf-8') as f:
                     json.dump(sync_data, f, indent=2, ensure_ascii=False)
             except Exception as e:
-                print(f"Warning: Could not update mapping file with audio path: {e}")
+                log.error(f"Could not update mapping file with audio path: {e}")
+                return 1
 
             # Create EPUB with media overlay
             overlay_path = add_media_overlay_to_epub(
                 dirs["epub_path"],
                 mapping_file,
-                output_path=os.path.join(dirs["process_dir"], f"{output_base}_audio.epub")
+                output_path=str(process_dir / f"{output_base}_audio.epub")
             )
 
             if overlay_path:
-                print(f"\nCreated EPUB with synchronized audio: {overlay_path}")
-                # Attempt to clean up temporary MP3 file
-                try:
-                    os.remove(temp_mp3_file)
-                except:
-                    pass
+                log.info(f"Created EPUB with synchronized audio: {overlay_path}")
                 return 0
             else:
-                print("\nFailed to create EPUB with media overlay")
+                log.error("Failed to create EPUB with media overlay")
                 return 1
-
         else:
             # Standard mode - create standalone audiobook
-            output_file = os.path.join(dirs["process_dir"], f"{output_base}.{args.format}")
+            log.info(f"Creating final audiobook in {args.format.upper()} format...")
 
-            # Assemble final audiobook based on format
-            if args.format.lower() == "m4b":
-                # Assemble as M4B with chapter markers
-                print("\nAssembling final audiobook with chapters (M4B format)...")
-                final_audiobook = assemble_audiobook_m4b(
-                    dirs["chapters_dir"],
-                    output_file,
-                    metadata,
-                    cover_file,
-                    mapping_file
-                )
-            else:
-                # Assemble as MP3 or other format using PyDub
-                print(f"\nAssembling final audiobook ({args.format.upper()} format)...")
-                # Ensure output file has correct extension
-                output_file = f"{os.path.splitext(output_file)[0]}.{args.format}"
-
-                # Combine all chapter files
-                combined = AudioSegment.empty()
-
-                chapter_files.sort(key=get_chapter_num)
-
-                print(f"Combining {len(chapter_files)} chapters...")
-                for chapter_file in tqdm(chapter_files):
-                    if os.path.exists(chapter_file):
-                        chapter_audio = AudioSegment.from_file(chapter_file, format=default_audio_proc_format)
-                        combined += chapter_audio
-
-                # Set bitrate based on format
-                bitrate = "128k"  # Default for MP3
-                if args.format == "flac":
-                    # FLAC is lossless so bitrate isn't specified the same way
-                    combined.export(output_file, format=args.format)
-                else:
-                    combined.export(output_file, format=args.format, bitrate=bitrate)
-
-                # Copy mapping file alongside the output
-                if mapping_file and os.path.exists(mapping_file):
-                    mapping_dest = f"{os.path.splitext(output_file)[0]}_sync.json"
-                    shutil.copy(mapping_file, mapping_dest)
-                    print(f"Copied synchronization data to: {mapping_dest}")
-
-                final_audiobook = output_file
+            final_audiobook = assemble_audiobook_m4b(
+                chapter_manager,
+                output_file,
+                metadata,
+                cover_file,
+                mapping_file if args.sync_text else None
+            )
 
             if final_audiobook and os.path.exists(final_audiobook):
-                print(f"\nAudiobook created successfully: {final_audiobook}")
-                print(f"Text-audio synchronization data: {mapping_file}")
+                log.info(f"Audiobook created successfully: {final_audiobook}")
+                if args.sync_text and mapping_file:
+                    log.info(f"Text-audio synchronization data included with the audiobook")
                 return 0
             else:
-                print("\nFailed to create audiobook")
+                log.error("Failed to create audiobook")
                 return 1
 
-    except DependencyError:
+    except DependencyError as e:
         # Already handled in the exception
+        log.error(f"Dependency error: {str(e)}")
         return 1
     except Exception as e:
-        print(f"Unexpected error: {e}")
-        traceback.print_exc()
+        log.exception(f"Unexpected error: {e}")
         return 1
 
 if __name__ == "__main__":
