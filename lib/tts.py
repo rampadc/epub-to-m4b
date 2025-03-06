@@ -1,8 +1,18 @@
 import io
 from kokoro_onnx import Kokoro
 import soundfile as sf
+from onnxruntime import InferenceSession
+import onnxruntime
+import os
+cpu_count = os.cpu_count()
 
-kokoro = Kokoro("kokoro-v1.0.onnx", "voices-v1.0.bin")
+sess_options = onnxruntime.SessionOptions()
+sess_options.intra_op_num_threads = os.cpu_count()
+
+session = InferenceSession(
+    "kokoro-v1.0.onnx", providers=['CoreMLExecutionProvider'], sess_options=sess_options
+)
+kokoro = Kokoro.from_session(session, "voices-v1.0.bin")
 
 def get_voices():
     return kokoro.get_voices()
