@@ -6,8 +6,8 @@ import sys
 import shutil
 import hashlib
 import ebooklib
-from ebooklib import epub
-from config import tmp_dir, switch_punctuations, punctuation_list
+import ftfy
+from config import tmp_dir, punctuation_list, switch_punctuations
 
 # --- DependencyError and other functions remain the same ---
 class DependencyError(Exception):
@@ -168,6 +168,9 @@ def convert_to_epub(input_file, output_file):
 
 def normalize_text(text):
     """Normalize text for TTS processing."""
+    # Fix character encoding and normalize quotes/apostrophes
+    text = ftfy.fix_text(text)
+
     # Replace problem punctuations
     for original, replacement in switch_punctuations.items():
         text = text.replace(original, replacement)
