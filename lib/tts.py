@@ -58,11 +58,11 @@ def get_audio(text, voice):
         voice (str): Voice ID to use
 
     Returns:
-        bytes: Audio content as WAV bytes or None if generation failed
+        tuple: (samples, sample_rate) or (None, None) if generation failed
     """
     if not kokoro:
         log.error("Kokoro TTS not initialized")
-        return None
+        return None, None
 
     try:
         # Preprocess text to avoid phonemizer warnings
@@ -70,7 +70,7 @@ def get_audio(text, voice):
 
         if not processed_text:
             log.warning("Empty text after preprocessing")
-            return None
+            return None, None
 
         # Generate audio
         samples, sample_rate = kokoro.create(processed_text, voice, is_phonemes=False)
@@ -83,18 +83,9 @@ def get_audio(text, voice):
                 samples, sample_rate = kokoro.create(processed_text, "af_heart", is_phonemes=False)
 
             if len(samples) == 0:
-                return None
+                return None, None
 
-        # Convert numpy array to WAV bytes
-        with io.BytesIO() as wav_io:
-            sf.write(
-                wav_io,
-                samples,
-                samplerate=sample_rate,
-                format='WAV',
-                subtype='PCM_16'
-            )
-            return wav_io.getvalue()
+        return samples, sample_rate
 
     except Exception as e:
         log.error(f"Kokoro TTS error: {e}")
@@ -108,18 +99,10 @@ def get_audio(text, voice):
             if simplified_text:
                 log.info("Retrying with simplified text")
                 samples, sample_rate = kokoro.create(simplified_text, voice, is_phonemes=False)
-
-                with io.BytesIO() as wav_io:
-                    sf.write(
-                        wav_io,
-                        samples,
-                        samplerate=sample_rate,
-                        format='WAV',
-                        subtype='PCM_16'
-                    )
-                    return wav_io.getvalue()
+                if len(samples) > 0:
+                    return samples, sample_rate
 
         except Exception as retry_error:
             log.error(f"Retry with simplified text failed: {retry_error}")
 
-        return None
+        return None, None

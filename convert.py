@@ -8,11 +8,10 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from tqdm import tqdm
 
-from config import DEFAULT_MAX_WORKERS, default_audio_proc_format
+from config import DEFAULT_MAX_WORKERS
 from lib.preprocess import DependencyError, convert_to_epub, get_book_metadata, get_cover, prepare_dirs
 from lib.chapter_manager import ChapterManager
 from lib.assemble_audio import assemble_audiobook_m4b, build_text_audio_mapping
-from lib.media_overlay import add_media_overlay_to_epub
 from lib.process import process_sentence
 from lib.tts import get_voices
 
@@ -129,8 +128,6 @@ def main():
                         help="Starting chapter number to process (default: 1)")
     parser.add_argument("--chapter-end", type=int, default=None,
                         help="Ending chapter number to process (inclusive, default: process all chapters)")
-    parser.add_argument("--create-media-overlay", action="store_true",
-                        help="Create EPUB with media overlay (synchronized text and audio)")
     parser.add_argument("--voice", default="af_heart", choices=get_voices(),
                         help="Kokoro voice to use")
     parser.add_argument("--voice-map", help="JSON file mapping chapter numbers to specific voices")
@@ -255,70 +252,25 @@ def main():
         output_base = Path(args.input).stem
         output_file = process_dir / f"{output_base}.{args.format}"
 
-        # Determine output mode based on media overlay setting
-        if args.create_media_overlay:
-            log.info("Creating EPUB with media overlay (synchronized text and audio)...")
-            # First create a temporary MP3 file for embedding in the EPUB
-            temp_mp3_file = process_dir / "temp_audiobook.mp3"
+        # Standard mode - create standalone audiobook
+        log.info(f"Creating final audiobook in {args.format.upper()} format...")
 
-            # Create a temporary audiobook in MP3 format
-            mp3_output = assemble_audiobook_m4b(
-                chapter_manager,
-                temp_mp3_file.with_suffix('.m4b'),
-                metadata,
-                cover_file
-            )
+        final_audiobook = assemble_audiobook_m4b(
+            chapter_manager,
+            output_file,
+            metadata,
+            cover_file,
+            mapping_file if args.sync_text else None
+        )
 
-            if not mp3_output:
-                log.error("Failed to create temporary audiobook")
-                return 1
-
-            # Update mapping file with the MP3 file path
-            try:
-                with open(mapping_file, 'r', encoding='utf-8') as f:
-                    sync_data = json.load(f)
-
-                sync_data["audio_file"] = str(temp_mp3_file)
-
-                with open(mapping_file, 'w', encoding='utf-8') as f:
-                    json.dump(sync_data, f, indent=2, ensure_ascii=False)
-            except Exception as e:
-                log.error(f"Could not update mapping file with audio path: {e}")
-                return 1
-
-            # Create EPUB with media overlay
-            overlay_path = add_media_overlay_to_epub(
-                dirs["epub_path"],
-                mapping_file,
-                output_path=str(process_dir / f"{output_base}_audio.epub")
-            )
-
-            if overlay_path:
-                log.info(f"Created EPUB with synchronized audio: {overlay_path}")
-                return 0
-            else:
-                log.error("Failed to create EPUB with media overlay")
-                return 1
+        if final_audiobook and os.path.exists(final_audiobook):
+            log.info(f"Audiobook created successfully: {final_audiobook}")
+            if args.sync_text and mapping_file:
+                log.info("Text-audio synchronization data included with the audiobook")
+            return 0
         else:
-            # Standard mode - create standalone audiobook
-            log.info(f"Creating final audiobook in {args.format.upper()} format...")
-
-            final_audiobook = assemble_audiobook_m4b(
-                chapter_manager,
-                output_file,
-                metadata,
-                cover_file,
-                mapping_file if args.sync_text else None
-            )
-
-            if final_audiobook and os.path.exists(final_audiobook):
-                log.info(f"Audiobook created successfully: {final_audiobook}")
-                if args.sync_text and mapping_file:
-                    log.info(f"Text-audio synchronization data included with the audiobook")
-                return 0
-            else:
-                log.error("Failed to create audiobook")
-                return 1
+            log.error("Failed to create audiobook")
+            return 1
 
     except DependencyError as e:
         # Already handled in the exception

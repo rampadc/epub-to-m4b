@@ -10,7 +10,6 @@ from datetime import datetime
 from pydub.audio_segment import AudioSegment
 from tqdm import tqdm
 
-from config import default_audio_proc_format
 import logging
 
 log = logging.getLogger(__name__)
@@ -38,7 +37,7 @@ def build_text_audio_mapping(chapter_manager, sentence_data):
         log.info("Calculating audio timings for synchronization...")
         for sentence_info in tqdm(sentence_data, desc="Processing timings"):
             chapter_num = sentence_info['chapter']
-            sentence_file = sentence_info['file']
+            sentence_file = sentence_info['file']  # This will be the MP3 file
 
             if not sentence_file.exists():
                 continue
@@ -47,7 +46,7 @@ def build_text_audio_mapping(chapter_manager, sentence_data):
                 chapter_start_times[chapter_num] = current_time_ms
 
             try:
-                audio = AudioSegment.from_file(sentence_file, format=default_audio_proc_format)
+                audio = AudioSegment.from_file(sentence_file, format='mp3')
                 duration_ms = len(audio)
 
                 fragment = {
@@ -55,7 +54,7 @@ def build_text_audio_mapping(chapter_manager, sentence_data):
                     "text": sentence_info['text'],
                     "start_time": current_time_ms,
                     "end_time": current_time_ms + duration_ms,
-                    "audio_file": str(sentence_info['file'])  # Store as string
+                    "audio_file": str(sentence_file)  # Keep MP3 reference for media overlay
                 }
                 mapping["fragments"].append(fragment)
                 current_time_ms += duration_ms
@@ -104,25 +103,90 @@ def assemble_audiobook_m4b(chapter_manager, output_file, metadata, cover_file, m
 
         log.info(f"Processing {len(chapter_files)} chapters...")
 
-        combined_audio_file = chapter_manager.output_dir / "combined_audio.wav"
-        combined = AudioSegment.empty()
+        # Verify files before concatenation
+        valid_chapter_files = []
+        skipped_files = []
+        for chapter_file in chapter_files:
+            # Check if file is valid using ffprobe
+            verify_cmd = [
+                'ffprobe',
+                '-v', 'error',
+                '-select_streams', 'a:0',
+                '-show_entries', 'format=duration',
+                '-of', 'default=noprint_wrappers=1:nokey=1',
+                str(chapter_file)
+            ]
+            try:
+                subprocess.run(verify_cmd, check=True, capture_output=True, text=True)
+                valid_chapter_files.append(chapter_file)
+            except subprocess.CalledProcessError:
+                skipped_files.append(chapter_file)
+                log.warning(f"Skipping corrupted file: {chapter_file}")
+
+        if skipped_files:
+            log.warning(f"Skipped {len(skipped_files)} corrupted files")
+            skipped_files_log = chapter_manager.output_dir / "skipped_files.txt"
+            with open(skipped_files_log, 'w', encoding='utf-8') as f:
+                f.write(f"Skipped files ({datetime.now().strftime('%Y-%m-%d %H:%M:%S')}):\n")
+                for file in skipped_files:
+                    f.write(f"{file}\n")
+            log.warning(f"List of skipped files written to: {skipped_files_log}")
+
+        if not valid_chapter_files:
+            log.error("No valid audio files found!")
+            return None
+
+        # Create a temporary file list for FFmpeg concatenation
+        concat_list = chapter_manager.output_dir / "concat_list.txt"
+        with open(concat_list, 'w', encoding='utf-8') as f:
+            for chapter_file in valid_chapter_files:
+                f.write(f"file '{chapter_file.absolute()}'\n")
+
+        # Use FFmpeg to directly concatenate the files
+        combined_audio_file = chapter_manager.output_dir / "combined_audio.mp3"
+        concat_cmd = [
+            'ffmpeg',
+            '-f', 'concat',
+            '-safe', '0',
+            '-i', str(concat_list),
+            '-c', 'copy',
+            '-y',
+            str(combined_audio_file)
+        ]
+
+        log.info("Combining audio files using FFmpeg...")
+        try:
+            subprocess.run(concat_cmd, check=True, capture_output=True, text=True)
+        except subprocess.CalledProcessError as e:
+            log.error(f"Error combining audio files: {e.stderr}")
+            return None
+
+        # Calculate chapter timestamps using ffprobe
         chapter_timestamps = []
         current_pos_ms = 0
 
-        for idx, chapter_file in enumerate(chapter_files):
-            chapter_audio = AudioSegment.from_file(chapter_file, format=default_audio_proc_format)
-            chapter_duration_ms = len(chapter_audio)
-            chapter_timestamps.append({
-                'number': idx + 1,
-                'start_ms': current_pos_ms,
-                'end_ms': current_pos_ms + chapter_duration_ms
-            })
-            current_pos_ms += chapter_duration_ms
-            combined += chapter_audio
-            log.info(f"Added Chapter {idx + 1} ({chapter_duration_ms / 1000:.2f} seconds)")
+        for idx, chapter_file in enumerate(valid_chapter_files):
+            try:
+                duration_cmd = [
+                    'ffprobe',
+                    '-v', 'error',
+                    '-show_entries', 'format=duration',
+                    '-of', 'default=noprint_wrappers=1:nokey=1',
+                    str(chapter_file)
+                ]
+                duration_output = subprocess.check_output(duration_cmd, text=True)
+                duration_ms = int(float(duration_output.strip()) * 1000)
 
-        combined.export(combined_audio_file, format=default_audio_proc_format)
-        log.info(f"Combined all chapters into: {combined_audio_file}")
+                chapter_timestamps.append({
+                    'number': idx + 1,
+                    'start_ms': current_pos_ms,
+                    'end_ms': current_pos_ms + duration_ms
+                })
+                current_pos_ms += duration_ms
+                log.info(f"Added Chapter {idx + 1} ({duration_ms / 1000:.2f} seconds)")
+            except (subprocess.CalledProcessError, ValueError) as e:
+                log.error(f"Error processing chapter {idx + 1}: {e}")
+                continue
 
         metadata_file = chapter_manager.output_dir / "metadata.txt"
         with open(metadata_file, 'w', encoding='utf-8') as f:
@@ -165,7 +229,7 @@ def assemble_audiobook_m4b(chapter_manager, output_file, metadata, cover_file, m
 
         ffmpeg_cmd = [
             'ffmpeg',
-            '-i', str(combined_audio_file),  # Convert Path to string
+            '-i', str(combined_audio_file),
             '-i', str(metadata_file)
         ]
 
@@ -206,9 +270,10 @@ def assemble_audiobook_m4b(chapter_manager, output_file, metadata, cover_file, m
                 log.info(f"Copied sync data to: {mapping_dest}")
             combined_audio_file.unlink()
             metadata_file.unlink()
+            concat_list.unlink()  # Clean up the concat list file
             return output_file
         else:
-            log.error(f"Error creating M4B.  FFmpeg exited with code {process.returncode}")
+            log.error(f"Error creating M4B. FFmpeg exited with code {process.returncode}")
             return None
 
     except Exception as e:

@@ -1,11 +1,10 @@
 import os
 import re
+import subprocess
 from bs4 import BeautifulSoup
 import ebooklib
 from ebooklib import epub
-from .preprocess import normalize_text, get_sentences  # Import from .preprocess
-from pydub import AudioSegment
-from config import default_audio_proc_format
+from .preprocess import normalize_text, get_sentences
 from pathlib import Path
 import logging
 
@@ -16,13 +15,13 @@ class ChapterManager:
         self.epub_path = Path(epub_path)
         self.output_dir = Path(output_dir)
         self.chapters_dir = self.output_dir / "chapters"
-        self.sentences_dir = self.chapters_dir / "sentences"
+        self.sentences_dir = self.chapters_dir / "sentences"  # For final MP3s
+        self.temp_dir = self.output_dir / "temp"  # For intermediary WAV files
         self.default_voice = default_voice
         self.book = None
         self._load_epub()
-        self.chapter_data = []  # List of dictionaries: {'number': int, 'title': str, 'sentences': [str], 'audio_files': [Path]}
+        self.chapter_data = []
         self._extract_chapters()
-
 
     def _load_epub(self):
         try:
@@ -33,7 +32,6 @@ class ChapterManager:
             raise
 
     def _extract_chapters(self):
-        """Extracts chapters, normalizes text, and splits into sentences."""
         if not self.book:
             return
 
@@ -50,35 +48,39 @@ class ChapterManager:
                 normalized_text = normalize_text(text)
                 sentences = get_sentences(normalized_text.split())
 
-                # Get chapter title from HTML content (if available)
-                title_tag = soup.find(['h1', 'h2', 'h3'])  # Common title tags
+                title_tag = soup.find(['h1', 'h2', 'h3'])
                 chapter_title = title_tag.get_text().strip() if title_tag else f"Chapter {chapter_number}"
 
                 self.chapter_data.append({
                     'number': chapter_number,
                     'title': chapter_title,
                     'sentences': sentences,
-                    'audio_files': [],  # Initially empty, populated during processing
+                    'audio_files': [],
                     'html_file': doc.file_name
                 })
                 chapter_number += 1
             except Exception as e:
                 log.error(f"Error processing document {doc.file_name}: {e}")
-                continue # Continue with the next document instead of crashing
-
-    def get_chapter_audio_filepath(self, chapter_number):
-        return self.chapters_dir / f"chapter_{chapter_number}.{default_audio_proc_format}"
-
-    def get_sentence_audio_filepath(self, chapter_number, sentence_number):
-        return self.sentences_dir / f"chapter_{chapter_number}_sentence_{sentence_number}.{default_audio_proc_format}"
-
+                continue
 
     def prepare_directories(self):
         """Creates the necessary output directories."""
         self.chapters_dir.mkdir(parents=True, exist_ok=True)
         self.sentences_dir.mkdir(parents=True, exist_ok=True)
-        log.info(f"Prepared directories: {self.chapters_dir}, {self.sentences_dir}")
+        self.temp_dir.mkdir(parents=True, exist_ok=True)
+        log.info(f"Prepared directories: {self.chapters_dir}, {self.sentences_dir}, {self.temp_dir}")
 
+    def get_chapter_audio_filepath(self, chapter_number):
+        """Returns the MP3 file path for a chapter."""
+        return self.chapters_dir / f"chapter_{chapter_number}.mp3"
+
+    def get_sentence_audio_filepath(self, chapter_number, sentence_number):
+        """Returns the MP3 file path for a sentence."""
+        return self.sentences_dir / f"chapter_{chapter_number}_sentence_{sentence_number}.mp3"
+
+    def get_temp_wav_filepath(self, chapter_number, sentence_number):
+        """Returns the temporary WAV file path for a sentence."""
+        return self.temp_dir / f"chapter_{chapter_number}_sentence_{sentence_number}.wav"
 
     def get_all_sentence_data(self, voice_map=None):
         """Returns a list of all sentences with associated data for processing."""
@@ -86,58 +88,88 @@ class ChapterManager:
 
         for chapter_info in self.chapter_data:
             chapter_num = chapter_info['number']
-            # Determine the voice for this chapter
-            voice = self.default_voice  # Default voice
-            if voice_map and chapter_num in voice_map:
-                voice = voice_map[chapter_num]  # Override with chapter-specific voice
-
+            voice = voice_map.get(chapter_num, self.default_voice) if voice_map else self.default_voice
 
             for i, sentence in enumerate(chapter_info['sentences']):
-                sentence_file = self.get_sentence_audio_filepath(chapter_num, i)
+                mp3_file = self.get_sentence_audio_filepath(chapter_num, i)
+                wav_file = self.get_temp_wav_filepath(chapter_num, i)
                 all_sentences.append({
                     'chapter': chapter_num,
                     'sentence_num': i,
                     'text': sentence,
-                    'file': sentence_file,
+                    'file': mp3_file,  # Final MP3 path for media overlay
+                    'wav_file': wav_file,  # Temporary WAV path for processing
                     'voice': voice
                 })
         return all_sentences
 
+    def wav_to_mp3(self, wav_path, mp3_path):
+        """Convert WAV to MP3 using ffmpeg."""
+        try:
+            subprocess.run([
+                'ffmpeg',
+                '-i', str(wav_path),
+                '-c:a', 'libmp3lame',
+                '-q:a', '4',
+                '-y',
+                str(mp3_path)
+            ], check=True, capture_output=True)
+            return True
+        except subprocess.CalledProcessError as e:
+            log.error(f"Error converting WAV to MP3: {e.stderr.decode()}")
+            return False
 
     def combine_sentences_to_chapter(self, chapter_number):
-        """Combines sentence audio files for a given chapter."""
+        """Combines sentence WAV files into chapter MP3."""
         chapter_info = self.get_chapter_info(chapter_number)
         if not chapter_info:
             log.error(f"Chapter {chapter_number} not found.")
             return False
 
         output_file = self.get_chapter_audio_filepath(chapter_number)
-        sentence_files = [data['file'] for data in self.get_all_sentence_data() if data['chapter'] == chapter_number]
+        sentence_data = [data for data in self.get_all_sentence_data()
+                        if data['chapter'] == chapter_number]
 
-        # Ensure sentence files exist
-        valid_sentence_files = [f for f in sentence_files if f.exists()]
-        if not valid_sentence_files:
-            log.warning(f"No sentence audio files found for chapter {chapter_number}.")
+        # Get WAV files for concatenation
+        wav_files = [data['wav_file'] for data in sentence_data]
+        valid_wav_files = [f for f in wav_files if f.exists()]
+
+        if not valid_wav_files:
+            log.warning(f"No WAV files found for chapter {chapter_number}.")
             return False
-        if len(valid_sentence_files) < len(sentence_files):
-            log.warning(f"Some sentence audio files missing for chapter {chapter_number}.")
-
-
-        combined = AudioSegment.empty()
-        for file in valid_sentence_files:
-            try:
-                audio = AudioSegment.from_file(file, format=default_audio_proc_format)
-                combined += audio
-            except Exception as e:
-                log.error(f"Error loading sentence audio {file}: {e}")
-                return False # Critical error, stop combining
 
         try:
-            combined.export(output_file, format=default_audio_proc_format)
-            log.info(f"Combined sentences into: {output_file}")
-            return True
+            # Create concat list
+            concat_list = self.temp_dir / f"concat_list_{chapter_number}.txt"
+            with open(concat_list, 'w') as f:
+                for wav in valid_wav_files:
+                    f.write(f"file '{wav.absolute()}'\n")
+
+            # Concatenate WAV files
+            temp_wav = self.temp_dir / f"chapter_{chapter_number}_combined.wav"
+            subprocess.run([
+                'ffmpeg', '-f', 'concat', '-safe', '0',
+                '-i', str(concat_list),
+                '-c', 'copy',
+                '-y', str(temp_wav)
+            ], check=True)
+
+            # Convert to final MP3
+            success = self.wav_to_mp3(temp_wav, output_file)
+
+            # Clean up temporary files
+            temp_wav.unlink(missing_ok=True)
+            concat_list.unlink(missing_ok=True)
+
+            if success:
+                log.info(f"Successfully created chapter {chapter_number} audio")
+                return True
+            else:
+                log.error(f"Failed to convert chapter {chapter_number} to MP3")
+                return False
+
         except Exception as e:
-            log.error(f"Error exporting combined chapter audio: {e}")
+            log.error(f"Error combining audio for chapter {chapter_number}: {e}")
             return False
 
     def get_chapter_info(self, chapter_number):
@@ -148,14 +180,16 @@ class ChapterManager:
         return None
 
     def get_html_file_by_chapter(self, chapter_number):
+        """Gets the HTML file associated with a chapter number."""
         chapter_info = self.get_chapter_info(chapter_number)
         if chapter_info:
             return chapter_info.get('html_file')
         return None
 
     def get_all_chapter_files(self):
-        """Returns a list of all chapter audio files."""
-        return sorted(list(self.chapters_dir.glob(f'*.{default_audio_proc_format}')), key=self._get_chapter_num_from_filepath)
+        """Returns a sorted list of all chapter audio files."""
+        return sorted(list(self.chapters_dir.glob('chapter_*.mp3')),
+                     key=self._get_chapter_num_from_filepath)
 
     def _get_chapter_num_from_filepath(self, filepath):
         """Extracts chapter number from filepath (for sorting)."""
@@ -163,3 +197,23 @@ class ChapterManager:
         if match:
             return int(match.group(1))
         return float('inf')
+
+    def cleanup_temp_files(self):
+        """Clean up all temporary WAV files."""
+        try:
+            for wav_file in self.temp_dir.glob('*.wav'):
+                wav_file.unlink(missing_ok=True)
+            for txt_file in self.temp_dir.glob('*.txt'):
+                txt_file.unlink(missing_ok=True)
+            self.temp_dir.rmdir()
+            log.info("Successfully cleaned up temporary files")
+        except Exception as e:
+            log.error(f"Error cleaning up temporary files: {e}")
+
+    def create_sentence_mp3(self, wav_path, mp3_path):
+        """Create MP3 file from WAV for media overlay."""
+        if not wav_path.exists():
+            log.error(f"WAV file not found: {wav_path}")
+            return False
+
+        return self.wav_to_mp3(wav_path, mp3_path)
