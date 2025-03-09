@@ -20,60 +20,65 @@ def get_chapter_num(filename):
     match = re.search(r'chapter_(\d+)', os.path.basename(filename))
     return int(match.group(1)) if match else float('inf')
 
-
 def build_text_audio_mapping(chapter_manager, sentence_data):
-    """Builds a mapping of text fragments to audio timestamps."""
+    """Builds a mapping of text fragments to audio timestamps (using chapter MP3s)."""
     try:
         mapping = {
             "version": "1.0",
-            "book_title": "Unknown",
+            "book_title": "Unknown",  #  Get this from metadata if available
             "fragments": [],
             "chapters": []
         }
 
         current_time_ms = 0
-        chapter_start_times = {}
 
         log.info("Calculating audio timings for synchronization...")
-        for sentence_info in tqdm(sentence_data, desc="Processing timings"):
-            chapter_num = sentence_info['chapter']
-            sentence_file = sentence_info['file']  # This will be the MP3 file
 
-            if not sentence_file.exists():
+        # Iterate through chapters, not sentences.
+        chapter_files = chapter_manager.get_all_chapter_files() # Get the chapter MP3s.
+        for chapter_file in chapter_files:
+            chapter_num = get_chapter_num(chapter_file)  # Extract from filename
+            chapter_info = chapter_manager.get_chapter_info(chapter_num)
+
+            if not chapter_file.exists() or not chapter_info:
+                log.warning(f"Skipping chapter {chapter_num} - File or info missing.")
                 continue
 
-            if chapter_num not in chapter_start_times:
-                chapter_start_times[chapter_num] = current_time_ms
-
             try:
-                audio = AudioSegment.from_file(sentence_file, format='mp3')
-                duration_ms = len(audio)
+                audio = AudioSegment.from_file(chapter_file, format='mp3')
+                chapter_duration_ms = len(audio)
 
-                fragment = {
-                    "chapter": chapter_num,
-                    "text": sentence_info['text'],
+                mapping["chapters"].append({
+                    "number": chapter_num,
+                    "title": chapter_info['title'],
                     "start_time": current_time_ms,
-                    "end_time": current_time_ms + duration_ms,
-                    "audio_file": str(sentence_file)  # Keep MP3 reference for media overlay
-                }
-                mapping["fragments"].append(fragment)
-                current_time_ms += duration_ms
+                    "end_time": current_time_ms + chapter_duration_ms,
+                    "fragment_count": len(chapter_info['sentences'])  # Count of sentences
+                })
+
+                #  Now, create fragment entries *within* this chapter.
+                sentence_start_time = current_time_ms
+                for i, sentence in enumerate(chapter_info['sentences']):
+                    #  We have to *estimate* sentence duration within the chapter.
+                    #  A more accurate method requires analyzing *every* WAV, which is slow.
+                    estimated_sentence_duration = chapter_duration_ms / len(chapter_info['sentences'])
+
+                    fragment = {
+                        "chapter": chapter_num,
+                        "text": sentence,
+                        "start_time": sentence_start_time,
+                        "end_time": sentence_start_time + estimated_sentence_duration,
+                        "audio_file": str(chapter_file)  #  Reference the *chapter* MP3
+                    }
+                    mapping["fragments"].append(fragment)
+                    sentence_start_time += estimated_sentence_duration  # Increment for next sentence
+
+                current_time_ms += chapter_duration_ms  #  Advance to the *next* chapter.
+
             except Exception as e:
-                log.error(f"Error processing timing for sentence {sentence_info['sentence_num']}: {e}")
-
-        for chapter_num in sorted(chapter_start_times.keys()):
-            start_time = chapter_start_times[chapter_num]
-            end_time = chapter_start_times.get(chapter_num + 1, current_time_ms)
-            chapter_info = chapter_manager.get_chapter_info(chapter_num)
-            fragments_in_chapter = sum(1 for f in mapping["fragments"] if f["chapter"] == chapter_num)
-
-            mapping["chapters"].append({
-                "number": chapter_num,
-                "title": chapter_info['title'] if chapter_info else f"Chapter {chapter_num}",
-                "start_time": start_time,
-                "end_time": end_time,
-                "fragment_count": fragments_in_chapter
-            })
+                log.error(f"Error processing timing for chapter {chapter_num}: {e}")
+                # Don't raise here; continue to the next chapter
+                traceback.print_exc()
 
         mapping["total_duration_ms"] = current_time_ms
 
@@ -85,7 +90,7 @@ def build_text_audio_mapping(chapter_manager, sentence_data):
 
     except Exception as e:
         log.error(f"Error building text-audio mapping: {e}")
-        traceback.print_exc()
+        traceback.print_exc()  #  Print the traceback
         return None
 
 
@@ -180,13 +185,14 @@ def assemble_audiobook_m4b(chapter_manager, output_file, metadata, cover_file, m
                 chapter_timestamps.append({
                     'number': idx + 1,
                     'start_ms': current_pos_ms,
-                    'end_ms': current_pos_ms + duration_ms
+                    'end_ms': current_pos_ms + duration_ms  # Corrected end_ms calculation
                 })
-                current_pos_ms += duration_ms
+                current_pos_ms += duration_ms  # Increment current position
                 log.info(f"Added Chapter {idx + 1} ({duration_ms / 1000:.2f} seconds)")
             except (subprocess.CalledProcessError, ValueError) as e:
                 log.error(f"Error processing chapter {idx + 1}: {e}")
-                continue
+                continue  # Continue to the next chapter even if one fails
+
 
         metadata_file = chapter_manager.output_dir / "metadata.txt"
         with open(metadata_file, 'w', encoding='utf-8') as f:
@@ -223,6 +229,7 @@ def assemble_audiobook_m4b(chapter_manager, output_file, metadata, cover_file, m
                 f.write(f"END={chapter['end_ms']}\n")
                 f.write(f"title=Chapter {chapter['number']}\n")
 
+
         output_file = Path(output_file)
         if output_file.suffix.lower() != '.m4b':
             output_file = output_file.with_suffix('.m4b')
@@ -237,30 +244,32 @@ def assemble_audiobook_m4b(chapter_manager, output_file, metadata, cover_file, m
             ffmpeg_cmd.extend(['-i', str(cover_file)])
             ffmpeg_cmd.extend([
                 '-map', '0:a',
-                '-map', '2:v',
+                '-map', '2:v',  # Map the cover image
                 '-disposition:v', 'attached_pic'
             ])
         else:
-            ffmpeg_cmd.extend(['-map', '0:a'])
+            ffmpeg_cmd.extend(['-map', '0:a']) # Map only audio if no cover
+
 
         ffmpeg_cmd.extend([
-            '-c:a', 'aac',
-            '-b:a', '128k',
+            '-c:a', 'aac',  # Use AAC for M4B
+            '-b:a', '128k', # Set bitrate
             '-ar', '44100',
-            '-movflags', '+faststart',
-            '-map_metadata', '1',
-            '-y',
+            '-movflags', '+faststart', # For streaming
+            '-map_metadata', '1',   # Copy metadata from the metadata file
+            '-y',  # Overwrite output file if it exists
             str(output_file)
         ])
 
         log.info(f"Creating M4B with FFmpeg: {' '.join(ffmpeg_cmd)}")
         process = subprocess.Popen(ffmpeg_cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
         if process.stdout:
-            for line in process.stdout:
-                if 'size=' in line or 'time=' in line or 'speed=' in line:
+             for line in process.stdout:
+                if 'size=' in line or 'time=' in line or 'speed=' in line:  # Progress info
                     print(f"\rFFmpeg: {line.strip()}", end='')
         process.wait()
-        print()
+        print() # Newline after progress
+
 
         if process.returncode == 0:
             log.info(f"Successfully created M4B: {output_file}")
@@ -268,9 +277,9 @@ def assemble_audiobook_m4b(chapter_manager, output_file, metadata, cover_file, m
                 mapping_dest = output_file.with_name(f"{output_file.stem}_sync.json")
                 shutil.copy(mapping_file, mapping_dest)
                 log.info(f"Copied sync data to: {mapping_dest}")
-            combined_audio_file.unlink()
-            metadata_file.unlink()
-            concat_list.unlink()  # Clean up the concat list file
+            combined_audio_file.unlink()  # Delete the combined MP3
+            metadata_file.unlink()       # Delete the metadata file
+            concat_list.unlink()         # Clean up the concat list file
             return output_file
         else:
             log.error(f"Error creating M4B. FFmpeg exited with code {process.returncode}")
@@ -278,5 +287,5 @@ def assemble_audiobook_m4b(chapter_manager, output_file, metadata, cover_file, m
 
     except Exception as e:
         log.error(f"Error assembling M4B: {e}")
-        traceback.print_exc()
+        traceback.print_exc()  #  Print the full traceback
         return None

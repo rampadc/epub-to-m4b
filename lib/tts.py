@@ -19,8 +19,15 @@ phonemizer_logger = logging.getLogger('phonemizer')
 phonemizer_logger.setLevel(logging.ERROR)  # Only show errors, not warnings
 
 try:
+    providers = [
+        ('CoreMLExecutionProvider', {
+            "ModelFormat": "MLProgram", "MLComputeUnits": "ALL",
+            "RequireStaticInputShapes": "0", "EnableOnSubgraphs": "0"
+        }),
+    ]
+
     session = InferenceSession(
-        "kokoro-v1.0.onnx", providers=['CoreMLExecutionProvider'], sess_options=sess_options
+        "kokoro-v1.0.onnx", providers=providers, sess_options=sess_options
     )
     kokoro = Kokoro.from_session(session, "voices-v1.0.bin")
     log.info("Kokoro TTS initialized successfully")

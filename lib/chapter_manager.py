@@ -15,7 +15,7 @@ class ChapterManager:
         self.epub_path = Path(epub_path)
         self.output_dir = Path(output_dir)
         self.chapters_dir = self.output_dir / "chapters"
-        self.sentences_dir = self.chapters_dir / "sentences"  # For final MP3s
+        # self.sentences_dir = self.chapters_dir / "sentences"  # No longer needed
         self.temp_dir = self.output_dir / "temp"  # For intermediary WAV files
         self.default_voice = default_voice
         self.book = None
@@ -55,7 +55,7 @@ class ChapterManager:
                     'number': chapter_number,
                     'title': chapter_title,
                     'sentences': sentences,
-                    'audio_files': [],
+                    'audio_files': [],  #  No longer storing individual sentence audio files
                     'html_file': doc.file_name
                 })
                 chapter_number += 1
@@ -66,17 +66,17 @@ class ChapterManager:
     def prepare_directories(self):
         """Creates the necessary output directories."""
         self.chapters_dir.mkdir(parents=True, exist_ok=True)
-        self.sentences_dir.mkdir(parents=True, exist_ok=True)
+        # self.sentences_dir.mkdir(parents=True, exist_ok=True)  # No longer needed
         self.temp_dir.mkdir(parents=True, exist_ok=True)
-        log.info(f"Prepared directories: {self.chapters_dir}, {self.sentences_dir}, {self.temp_dir}")
+        log.info(f"Prepared directories: {self.chapters_dir}, {self.temp_dir}")
 
     def get_chapter_audio_filepath(self, chapter_number):
         """Returns the MP3 file path for a chapter."""
         return self.chapters_dir / f"chapter_{chapter_number}.mp3"
 
-    def get_sentence_audio_filepath(self, chapter_number, sentence_number):
-        """Returns the MP3 file path for a sentence."""
-        return self.sentences_dir / f"chapter_{chapter_number}_sentence_{sentence_number}.mp3"
+    # def get_sentence_audio_filepath(self, chapter_number, sentence_number): # No longer needed
+    #     """Returns the MP3 file path for a sentence."""
+    #     return self.sentences_dir / f"chapter_{chapter_number}_sentence_{sentence_number}.mp3"
 
     def get_temp_wav_filepath(self, chapter_number, sentence_number):
         """Returns the temporary WAV file path for a sentence."""
@@ -91,14 +91,14 @@ class ChapterManager:
             voice = voice_map.get(chapter_num, self.default_voice) if voice_map else self.default_voice
 
             for i, sentence in enumerate(chapter_info['sentences']):
-                mp3_file = self.get_sentence_audio_filepath(chapter_num, i)
+                # mp3_file = self.get_sentence_audio_filepath(chapter_num, i) # No longer needed
                 wav_file = self.get_temp_wav_filepath(chapter_num, i)
                 all_sentences.append({
                     'chapter': chapter_num,
                     'sentence_num': i,
                     'text': sentence,
-                    'file': mp3_file,  # Final MP3 path for media overlay
-                    'wav_file': wav_file,  # Temporary WAV path for processing
+                    # 'file': mp3_file,  # No longer needed
+                    'wav_file': wav_file,
                     'voice': voice
                 })
         return all_sentences
@@ -163,7 +163,7 @@ class ChapterManager:
 
             if success:
                 log.info(f"Successfully created chapter {chapter_number} audio")
-                return True
+                return output_file # Return the path to the created MP3
             else:
                 log.error(f"Failed to convert chapter {chapter_number} to MP3")
                 return False
@@ -187,7 +187,7 @@ class ChapterManager:
         return None
 
     def get_all_chapter_files(self):
-        """Returns a sorted list of all chapter audio files."""
+        """Returns a sorted list of all chapter audio files (MP3s)."""
         return sorted(list(self.chapters_dir.glob('chapter_*.mp3')),
                      key=self._get_chapter_num_from_filepath)
 
@@ -210,10 +210,6 @@ class ChapterManager:
         except Exception as e:
             log.error(f"Error cleaning up temporary files: {e}")
 
-    def create_sentence_mp3(self, wav_path, mp3_path):
-        """Create MP3 file from WAV for media overlay."""
-        if not wav_path.exists():
-            log.error(f"WAV file not found: {wav_path}")
-            return False
-
-        return self.wav_to_mp3(wav_path, mp3_path)
+    # def create_sentence_mp3(self, wav_path, mp3_path): # No longer needed
+    #    """Create MP3 file from WAV for media overlay."""
+    #    return self.wav_to_mp3(wav_path, mp3_path)

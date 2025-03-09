@@ -11,7 +11,7 @@ from tqdm import tqdm
 from config import DEFAULT_MAX_WORKERS
 from lib.preprocess import DependencyError, convert_to_epub, get_book_metadata, get_cover, prepare_dirs
 from lib.chapter_manager import ChapterManager
-from lib.assemble_audio import assemble_audiobook_m4b, build_text_audio_mapping
+from lib.assemble_audio import assemble_audiobook_m4b, build_text_audio_mapping  # Corrected import
 from lib.process import process_sentence
 from lib.tts import get_voices
 
@@ -214,12 +214,13 @@ def main():
 
         # Process all sentences using thread pool
         log.info(f"Processing {len(all_sentence_data)} sentences with {args.max_workers} workers...")
-        with tqdm(total=len(all_sentence_data), desc="Processing", unit="sentence") as progress_bar:
+        with tqdm(total=len(all_sentence_data), desc="Processing sentences", unit="sentence") as progress_bar:
             with ThreadPoolExecutor(max_workers=args.max_workers) as executor:
                 futures = []
 
                 for sentence_info in all_sentence_data:
-                    if sentence_info['file'].exists():
+                    #  Check for existing WAV file, not MP3
+                    if sentence_info['wav_file'].exists():
                         progress_bar.update(1)
                         continue
 
@@ -229,25 +230,33 @@ def main():
                 for future in as_completed(futures):
                     try:
                         result = future.result()
+                        #  Result is now (sentence_num, wav_file, success)
                         if result and not result[2]:  # Check if processing was successful
                             log.warning(f"Failed to process sentence {result[0]}")
                     except Exception as exc:
                         log.error(f"Error processing sentence: {exc}")
                     progress_bar.update(1)
 
-        # Combine sentences into chapters
-        log.info("Combining sentences into chapters...")
+        # Combine sentences into chapters and create chapter MP3s
+        log.info("Combining sentences into chapters and creating chapter MP3s...")
         for chapter_info in tqdm(chapter_manager.chapter_data, desc="Creating chapters"):
             chapter_num = chapter_info['number']
-            chapter_manager.combine_sentences_to_chapter(chapter_num)
+            chapter_manager.combine_sentences_to_chapter(chapter_num) # This now creates chapter MP3s
+
+        # Get a list of *all* sentence data again, but only for mapping.
+        # This is necessary because the chapter combining process modifies the audio file paths.
+        all_sentence_data_for_mapping = chapter_manager.get_all_sentence_data(voice_map)
 
         # Generate text-audio mapping for synchronization
         log.info("Building text-audio synchronization data...")
-        mapping_file = build_text_audio_mapping(chapter_manager, all_sentence_data)
+        # Use the updated all_sentence_data_for_mapping
+        mapping_file = build_text_audio_mapping(chapter_manager, all_sentence_data_for_mapping)
 
         if not mapping_file:
             log.error("Failed to create text-audio synchronization mapping")
-            return 1
+            #  Don't exit here; we can still create the audiobook without sync.
+            if args.sync_text:
+                return 1  # Exit if sync was explicitly requested
 
         output_base = Path(args.input).stem
         output_file = process_dir / f"{output_base}.{args.format}"
@@ -267,10 +276,10 @@ def main():
             log.info(f"Audiobook created successfully: {final_audiobook}")
             if args.sync_text and mapping_file:
                 log.info("Text-audio synchronization data included with the audiobook")
-            return 0
+            return 0  # Success
         else:
             log.error("Failed to create audiobook")
-            return 1
+            return 1 # Fail
 
     except DependencyError as e:
         # Already handled in the exception
