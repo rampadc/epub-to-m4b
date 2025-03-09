@@ -2,7 +2,7 @@ import io
 import logging
 from kokoro_onnx import Kokoro
 import soundfile as sf
-from onnxruntime import InferenceSession
+from onnxruntime import InferenceSession, get_available_providers
 import onnxruntime
 import os
 import re
@@ -18,13 +18,45 @@ sess_options.intra_op_num_threads = cpu_count
 phonemizer_logger = logging.getLogger('phonemizer')
 phonemizer_logger.setLevel(logging.ERROR)  # Only show errors, not warnings
 
-try:
-    providers = [
-        ('CoreMLExecutionProvider', {
-            "ModelFormat": "MLProgram", "MLComputeUnits": "ALL",
-            "RequireStaticInputShapes": "0", "EnableOnSubgraphs": "0"
-        }),
+def get_best_execution_provider():
+    """
+    Gets the best available execution provider, prioritizing:
+    1. Explicit environment variable
+    2. CUDA
+    3. TensorRT
+    4. Core ML
+    5. CPU (fallback)
+    """
+    available_providers = get_available_providers()
+    log.info(f"Available ONNX execution providers: {available_providers}")
+
+    # 1. Check for explicit environment variable override
+    explicit_provider = os.environ.get('ONNX_EXECUTION_PROVIDER')
+    if explicit_provider:
+        if explicit_provider in available_providers:
+            log.info(f"Using explicitly specified ONNX execution provider: {explicit_provider}")
+            return [explicit_provider]
+        else:
+            log.warning(f"Explicitly specified provider '{explicit_provider}' not available.  Trying automatic detection...")
+
+    # 2. Prioritize CUDA, then TensorRT, then Core ML, then CPU.
+    preferred_providers = [
+        'CUDAExecutionProvider',    # NVIDIA GPUs (CUDA)
+        'TensorrtExecutionProvider', # NVIDIA GPUs (TensorRT)
+        'CoreMLExecutionProvider',  # macOS (Apple Silicon)
+        'CPUExecutionProvider',     # Fallback to CPU
     ]
+
+    for provider in preferred_providers:
+        if provider in available_providers:
+            log.info(f"Using ONNX execution provider: {provider}")
+            return [provider]
+
+    log.error("No suitable ONNX execution provider found.  Falling back to CPU.  This will be very slow!")
+    return ['CPUExecutionProvider'] # Explicitly return CPU as a fallback
+
+try:
+    providers = get_best_execution_provider()
 
     session = InferenceSession(
         "kokoro-v1.0.onnx", providers=providers, sess_options=sess_options
