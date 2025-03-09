@@ -1,37 +1,51 @@
-import os
-
-from pydub.audio_segment import AudioSegment
-from config import default_audio_proc_format
+from pydub import AudioSegment
 from lib.tts import get_audio
+import logging
+
+log = logging.getLogger(__name__)
 
 def process_sentence(sentence_data):
-    """Process a single sentence chunk and return the result"""
-    if len(sentence_data) == 4:  # New format with voice parameter
-        sentence_num, sentence, sentence_file, voice = sentence_data
-    else:  # Backward compatibility
-        sentence_num, sentence, sentence_file = sentence_data
-        voice = 'af_heart'
+    """Process a single sentence and save as WAV for intermediate processing."""
+    import numpy as np
+    import wave
 
-    if os.path.exists(sentence_file):
-        # File already exists, skip processing
-        return sentence_num, sentence_file, True
+    sentence_num = sentence_data['sentence_num']
+    sentence = sentence_data['text']
+    mp3_file = sentence_data['file']  # Keep track of final MP3 path
+    wav_file = sentence_data['wav_file']  # Temporary WAV path
+    voice = sentence_data['voice']
 
-    # Handle special pause indicator
+    # If MP3 exists, we've already processed this sentence
+    if mp3_file.exists():
+        return sentence_num, mp3_file, wav_file, True
+
     if sentence == "[PAUSE]":
-        # Create a short pause (0.5 second of silence)
-        silence = AudioSegment.silent(duration=500)  # 500ms
-        silence.export(sentence_file, format=default_audio_proc_format)
-        return sentence_num, sentence_file, True
+        silence = AudioSegment.silent(duration=500)
+        silence.export(wav_file, format="wav")
+        return sentence_num, mp3_file, wav_file, True
 
-    # Get audio from API
-    audio_data = get_audio(
-        text=sentence, voice=voice
-    )
+    samples, sample_rate = get_audio(text=sentence, voice=voice)
 
-    if audio_data:
-        # Save the audio file
-        with open(sentence_file, 'wb') as f:
-            f.write(audio_data)
-        return sentence_num, sentence_file, True
+    if samples is not None and sample_rate is not None:
+        try:
+            # Convert to 16-bit int
+            samples = (samples * 32767).astype(np.int16)
+
+            # Create WAV file directory if it doesn't exist
+            wav_file.parent.mkdir(parents=True, exist_ok=True)
+
+            # Write WAV file directly
+            with wave.open(str(wav_file), 'wb') as wf:
+                wf.setnchannels(1)
+                wf.setsampwidth(2)
+                wf.setframerate(sample_rate)
+                wf.writeframes(samples.tobytes())
+
+            return sentence_num, mp3_file, wav_file, True
+
+        except Exception as e:
+            log.error(f"Failed to create WAV for sentence {sentence_num}: {e}")
+            return sentence_num, mp3_file, wav_file, False
     else:
-        return sentence_num, sentence_file, False
+        log.error(f"Failed to generate audio for sentence {sentence_num}")
+        return sentence_num, mp3_file, wav_file, False
