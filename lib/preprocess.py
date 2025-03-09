@@ -211,7 +211,7 @@ def get_sentences(phoneme_list):
     complete_text = ' '.join(phoneme_list)
 
     # Replace our special tokens with actual pause indicators
-    complete_text = complete_text.replace("[PARAGRAPH_BREAK]", "[PAUSE][PAUSE]")  # Double pause for paragraphs
+    complete_text = complete_text.replace("[PARAGRAPH_BREAK]", "[PAUSE]")  # Double pause for paragraphs
     complete_text = complete_text.replace("[EMDASH]", "[PAUSE]")  # Single pause for em dashes
 
     sentence_pattern = r'(?<=[.!?])\s+(?=[A-Z]|$)'
