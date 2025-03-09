@@ -178,9 +178,12 @@ def normalize_text(text):
     # Replace NBSP with a normal space
     text = text.replace("\xa0", " ")
 
-    # Replace multiple newlines with periods
-    text = re.sub('(\r\n|\n\n|\r\r|\n\r)+', lambda m: ' . ' * (m.group().count("\n") // 2 + m.group().count("\r") // 2),
-                  text)
+    # Mark paragraph breaks with special token instead of removing them
+    text = re.sub('(\r\n|\n\n|\r\r|\n\r)+', ' [PARAGRAPH_BREAK] ', text)
+
+    # Mark em dashes for pausing
+    text = text.replace("–", " [EMDASH] ")
+    text = text.replace("—", " [EMDASH] ")  # Also cover other em dash character
 
     # Replace single newlines with spaces
     text = re.sub(r'[\r\n]', ' ', text)
@@ -203,9 +206,14 @@ def normalize_text(text):
 
 
 def get_sentences(phoneme_list):
-    """Splits a list of phonemes into sentences, respecting character limits."""
+    """Splits a list of phonemes into sentences, respecting character limits and adding pauses."""
     max_chars = 500
     complete_text = ' '.join(phoneme_list)
+
+    # Replace our special tokens with actual pause indicators
+    complete_text = complete_text.replace("[PARAGRAPH_BREAK]", "[PAUSE][PAUSE]")  # Double pause for paragraphs
+    complete_text = complete_text.replace("[EMDASH]", "[PAUSE]")  # Single pause for em dashes
+
     sentence_pattern = r'(?<=[.!?])\s+(?=[A-Z]|$)'
     raw_sentences = re.split(sentence_pattern, complete_text)
     final_sentences = []
@@ -213,6 +221,18 @@ def get_sentences(phoneme_list):
     for sentence in raw_sentences:
         sentence = sentence.strip()
         if not sentence:
+            continue
+
+        # Handle pause indicators
+        if "[PAUSE]" in sentence:
+            # Split by pause indicators and process each part
+            parts = sentence.split("[PAUSE]")
+            for i, part in enumerate(parts):
+                part = part.strip()
+                if part:  # Add non-empty parts
+                    final_sentences.append(part)
+                if i < len(parts) - 1:  # Add pause after each part except the last
+                    final_sentences.append("[PAUSE]")
             continue
 
         if len(sentence) <= max_chars:
